@@ -1,0 +1,7 @@
+node_modules/
+python/**/__pycache__/
+python/**/*.pyc
+python/**/*.pyo
+test/
+tsconfig.json
+.github/

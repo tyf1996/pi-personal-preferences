@@ -1,0 +1,50 @@
+{
+  "name": "pi-personal-preferences",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "exports": "./index.ts",
+  "description": "Local, reviewable personal preference evolution for Pi",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tyf1996/pi-personal-preferences.git"
+  },
+  "homepage": "https://github.com/tyf1996/pi-personal-preferences#readme",
+  "bugs": {
+    "url": "https://github.com/tyf1996/pi-personal-preferences/issues"
+  },
+  "keywords": [
+    "pi-package"
+  ],
+  "files": [
+    "index.ts",
+    "src/*.ts",
+    "python/**/*.py",
+    "scripts/*.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.22.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@types/node": "^22.18.0",
+    "typescript": "^5.9.2"
+  },
+  "scripts": {
+    "sync-python": "node scripts/sync-python.mjs",
+    "check-python": "node scripts/sync-python.mjs --check",
+    "prepack": "npm run check-python",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "check": "npm run check-python && npm run typecheck && npm test"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
