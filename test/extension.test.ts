@@ -27,6 +27,9 @@ interface HarnessOptions {
   editors?: Array<string | undefined>;
   confirms?: boolean[];
   hasUI?: boolean;
+  piModelResponses?: string[];
+  configuredAuth?: boolean;
+  thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 }
 
 function createHarness(cwd: string, options: HarnessOptions = {}) {
@@ -39,6 +42,27 @@ function createHarness(cwd: string, options: HarnessOptions = {}) {
   const inputs = [...(options.inputs ?? [])];
   const editors = [...(options.editors ?? [])];
   const confirms = [...(options.confirms ?? [])];
+  const piModelResponses = [...(options.piModelResponses ?? [])];
+  const modelCalls: Array<{
+    prompt: string;
+    reasoning?: string;
+    baseUrl?: string;
+    apiKey?: string;
+    headers?: Record<string, string>;
+    env?: Record<string, string>;
+  }> = [];
+  const model = options.piModelResponses ? {
+    id: "test-model",
+    name: "Test Model",
+    api: "openai-completions",
+    provider: "test-provider",
+    baseUrl: "https://example.test/v1",
+    reasoning: true,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 128_000,
+    maxTokens: 8_192,
+  } : undefined;
   let reloads = 0;
   const pi = {
     on(name: string, handler: Handler) {
@@ -54,6 +78,51 @@ function createHarness(cwd: string, options: HarnessOptions = {}) {
     hasUI: options.hasUI ?? true,
     mode: "tui",
     sessionManager: { getSessionId: () => "session-test" },
+    model,
+    thinkingLevel: options.thinkingLevel ?? "off",
+    modelRegistry: {
+      hasConfiguredAuth: () => Boolean(model) && (options.configuredAuth ?? true),
+      getApiKeyAndHeaders: async () => ({
+        ok: true,
+        apiKey: "test-key",
+        headers: { "x-test-auth": "header" },
+        env: { TEST_PROVIDER_ENV: "value" },
+        baseUrl: "https://resolved.example.test/v1",
+      }),
+      getProvider: () => model ? {
+        streamSimple: (selectedModel: any, context: any, requestOptions: any) => {
+          const prompt = context.messages[0]?.content[0]?.text ?? "";
+          modelCalls.push({
+            prompt,
+            reasoning: requestOptions.reasoning,
+            baseUrl: selectedModel.baseUrl,
+            apiKey: requestOptions.apiKey,
+            headers: requestOptions.headers,
+            env: requestOptions.env,
+          });
+          return {
+            result: async () => {
+              const response = piModelResponses.shift();
+              if (response === undefined) throw new Error("test Pi model response is missing");
+              return {
+                role: "assistant",
+                content: [{ type: "text", text: response }],
+                api: "openai-completions",
+                provider: "test-provider",
+                model: "test-model",
+                usage: {
+                  input: 0, output: 0, cacheRead: 0, cacheWrite: 0,
+                  totalTokens: 0,
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+                },
+                stopReason: "stop",
+                timestamp: Date.now(),
+              };
+            },
+          };
+        },
+      } : undefined,
+    },
     ui: {
       notify: (message: string, level: string) => notices.push({ message, level }),
       setStatus: (_key: string, value: string | undefined) => statuses.push(value),
@@ -80,7 +149,7 @@ function createHarness(cwd: string, options: HarnessOptions = {}) {
       reloads += 1;
     },
   } as unknown as ExtensionCommandContext;
-  return { commands, ctx, handlers, notices, statuses, uiCalls, get reloads() { return reloads; } };
+  return { commands, ctx, handlers, notices, statuses, uiCalls, modelCalls, get reloads() { return reloads; } };
 }
 
 function init(root: string): void {
@@ -90,7 +159,12 @@ function init(root: string): void {
 async function configureFake(root: string): Promise<void> {
   const path = join(root, "config.json");
   const config = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
-  config.provider = { name: "fake", model: "fixture", api_key_env: "PREFERENCE_MODEL_API_KEY" };
+  config.provider = {
+    name: "fake",
+    model: "fixture",
+    api_key_env: "PREFERENCE_MODEL_API_KEY",
+    thinking_level: "medium",
+  };
   await writeFile(path, JSON.stringify(config), "utf8");
 }
 
@@ -226,6 +300,64 @@ test("remember writes the explicit group without reload and group completion is 
   }
 });
 
+test("default Pi model classifies preferences and inherits or overrides thinking level", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-personal-preferences-pi-model-"));
+  const previousRoot = process.env.PI_PREFERENCE_DATA_ROOT;
+  process.env.PI_PREFERENCE_DATA_ROOT = root;
+  try {
+    init(root);
+    execFileSync("python3", [CLI, "manage-group", "--stdin", "--data-root", root], {
+      input: JSON.stringify({ action: "create", name: "communication", description: "回复表达。" }),
+      encoding: "utf8",
+    });
+    const configPath = join(root, "config.json");
+    const legacyConfig = JSON.parse(await readFile(configPath, "utf8"));
+    legacyConfig.provider = {
+      name: "openai_compatible",
+      model: "configured-model",
+      api_key_env: "PREFERENCE_MODEL_API_KEY",
+    };
+    await writeFile(configPath, JSON.stringify(legacyConfig), "utf8");
+    const inherited = createHarness(root, {
+      piModelResponses: ['{"group":"communication"}'],
+      configuredAuth: false,
+      thinkingLevel: "high",
+    });
+    await inherited.handlers.get("session_start")?.({}, inherited.ctx);
+    assert.match(inherited.statuses.at(-1) ?? "", /model ready \(pi test-provider\/test-model, thinking high, timeout 300s\)/u);
+    assert.deepEqual(
+      JSON.parse(await readFile(configPath, "utf8")).provider,
+      { name: "pi", thinking_level: "inherit", timeout_seconds: 300 },
+    );
+    await inherited.commands.get("pref")?.handler("remember 回答保持简洁", inherited.ctx);
+    assert.equal(inherited.modelCalls.length, 1);
+    assert.equal(inherited.modelCalls[0]?.reasoning, "high");
+    assert.equal(inherited.modelCalls[0]?.baseUrl, "https://resolved.example.test/v1");
+    assert.equal(inherited.modelCalls[0]?.apiKey, "test-key");
+    assert.deepEqual(inherited.modelCalls[0]?.headers, { "x-test-auth": "header" });
+    assert.deepEqual(inherited.modelCalls[0]?.env, { TEST_PROVIDER_ENV: "value" });
+    assert.match(inherited.modelCalls[0]?.prompt ?? "", /personal preference into one existing preference group/u);
+    let groups = JSON.parse(await readFile(join(root, "repo/groups.json"), "utf8"));
+    assert.deepEqual(groups.groups.find((group: any) => group.name === "communication").rules, ["回答保持简洁"]);
+
+    const config = JSON.parse(await readFile(configPath, "utf8"));
+    config.provider.thinking_level = "low";
+    await writeFile(configPath, JSON.stringify(config), "utf8");
+    const overridden = createHarness(root, {
+      piModelResponses: ['{"group":"global"}'],
+      thinkingLevel: "xhigh",
+    });
+    await overridden.commands.get("pref")?.handler("remember 默认使用中文", overridden.ctx);
+    assert.equal(overridden.modelCalls[0]?.reasoning, "low");
+    groups = JSON.parse(await readFile(join(root, "repo/groups.json"), "utf8"));
+    assert.deepEqual(groups.groups.find((group: any) => group.name === "global").rules, ["默认使用中文"]);
+  } finally {
+    if (previousRoot === undefined) delete process.env.PI_PREFERENCE_DATA_ROOT;
+    else process.env.PI_PREFERENCE_DATA_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("first /pref initializes local data and opens a model-aware dashboard", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-personal-preferences-first-run-"));
   const previousRoot = process.env.PI_PREFERENCE_DATA_ROOT;
@@ -240,8 +372,9 @@ test("first /pref initializes local data and opens a model-aware dashboard", asy
     assert.equal((await readFile(join(root, "local/activations.json"), "utf8")).includes("directories"), true);
     assert.match(harness.notices[0]?.message ?? "", /已初始化/u);
     assert.match(harness.notices[1]?.message ?? "", /model not ready/u);
-    assert.match(harness.notices[1]?.message ?? "", /endpoint missing/u);
-    assert.match(harness.notices[1]?.message ?? "", /credential PREFERENCE_MODEL_API_KEY missing/u);
+    assert.match(harness.notices[1]?.message ?? "", /pi pi\/current/u);
+    assert.match(harness.notices[1]?.message ?? "", /endpoint Pi managed/u);
+    assert.match(harness.notices[1]?.message ?? "", /credential Pi managed/u);
     assert.equal(harness.uiCalls[0]?.title, "个人偏好");
   } finally {
     if (previousRoot === undefined) delete process.env.PI_PREFERENCE_DATA_ROOT;
@@ -438,7 +571,7 @@ test("auto evolves pending evidence without file collection or a current task", 
     }] });
     const harness = createHarness(root);
     await harness.handlers.get("session_start")?.({}, harness.ctx);
-    assert.match(harness.statuses.at(-1) ?? "", /model ready \(fake\/fixture\).*endpoint ready.*credential PREFERENCE_MODEL_API_KEY ready/u);
+    assert.match(harness.statuses.at(-1) ?? "", /model ready \(custom fake\/fixture, thinking medium, timeout 60s\).*endpoint ready.*credential PREFERENCE_MODEL_API_KEY ready/u);
     await harness.handlers.get("agent_settled")?.({}, harness.ctx);
     const groups = JSON.parse(await readFile(join(root, "repo/groups.json"), "utf8"));
     assert.deepEqual(groups.groups[0].rules, ["回答保持简洁。"]);
@@ -447,6 +580,43 @@ test("auto evolves pending evidence without file collection or a current task", 
     else process.env.PI_PREFERENCE_DATA_ROOT = previousRoot;
     if (previousResponse === undefined) delete process.env.PREFERENCE_MODEL_RESPONSE;
     else process.env.PREFERENCE_MODEL_RESPONSE = previousResponse;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("default Pi model evolves pending evidence through the bridge", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-personal-preferences-pi-evolve-"));
+  const previousRoot = process.env.PI_PREFERENCE_DATA_ROOT;
+  process.env.PI_PREFERENCE_DATA_ROOT = root;
+  try {
+    init(root);
+    const captured = JSON.parse(execFileSync("python3", [CLI, "capture", "--stdin", "--data-root", root], {
+      input: JSON.stringify({
+        group: "global", signal: "rejection", summary: "回答太长。", task_id: "task-pi", paths: [],
+      }),
+      encoding: "utf8",
+    })) as { event_id: string };
+    const configPath = join(root, "config.json");
+    const config = JSON.parse(await readFile(configPath, "utf8"));
+    config.auto_evolve = true;
+    config.auto_evolve_after = 1;
+    await writeFile(configPath, JSON.stringify(config), "utf8");
+    const harness = createHarness(root, {
+      piModelResponses: [JSON.stringify({ changes: [{
+        action: "add", group: "global", rule: "回答保持简洁。", evidence_ids: [captured.event_id],
+      }] })],
+      thinkingLevel: "medium",
+    });
+    await harness.handlers.get("session_start")?.({}, harness.ctx);
+    await harness.handlers.get("agent_settled")?.({}, harness.ctx);
+    assert.equal(harness.modelCalls.length, 1);
+    assert.equal(harness.modelCalls[0]?.reasoning, "medium");
+    assert.match(harness.modelCalls[0]?.prompt ?? "", /update rules inside existing personal preference groups/u);
+    const groups = JSON.parse(await readFile(join(root, "repo/groups.json"), "utf8"));
+    assert.deepEqual(groups.groups[0].rules, ["回答保持简洁。"]);
+  } finally {
+    if (previousRoot === undefined) delete process.env.PI_PREFERENCE_DATA_ROOT;
+    else process.env.PI_PREFERENCE_DATA_ROOT = previousRoot;
     await rm(root, { recursive: true, force: true });
   }
 });

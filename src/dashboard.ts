@@ -17,8 +17,11 @@ export interface PreferenceStatus {
   evolve_due?: boolean;
   model_ready?: boolean;
   model_status?: string;
+  provider_source?: string;
   provider_name?: string;
   provider_model?: string;
+  provider_thinking_level?: string;
+  provider_timeout_seconds?: number;
   provider_base_url_ready?: boolean;
   provider_credential_env?: string;
   provider_credential_ready?: boolean;
@@ -96,12 +99,19 @@ export function formatPreferenceSummary(status: PreferenceStatus, effectiveGroup
   const visibleGroups = status.enabled === false ? [] : effectiveGroups;
   const groups = visibleGroups.length ? visibleGroups.join(", ") : "none";
   const enabled = status.enabled === false ? "disabled" : "enabled";
+  const source = text(status.provider_source, "custom");
   const provider = `${text(status.provider_name, "unknown")}/${text(status.provider_model, "unknown")}`;
+  const thinking = text(status.provider_thinking_level, "off");
+  const timeout = number(status.provider_timeout_seconds);
   const model = status.model_ready === true
-    ? `ready (${provider})`
-    : `not ready (${provider}: ${text(status.model_status, "not configured")})`;
-  const endpoint = status.provider_base_url_ready === true ? "ready" : "missing";
-  const credential = `${text(status.provider_credential_env, "unknown")} ${status.provider_credential_ready === true ? "ready" : "missing"}`;
+    ? `ready (${source} ${provider}, thinking ${thinking}, timeout ${timeout}s)`
+    : `not ready (${source} ${provider}, thinking ${thinking}, timeout ${timeout}s: ${text(status.model_status, "not configured")})`;
+  const endpoint = source === "pi"
+    ? "Pi managed"
+    : status.provider_base_url_ready === true ? "ready" : "missing";
+  const credential = source === "pi"
+    ? "Pi managed"
+    : `${text(status.provider_credential_env, "unknown")} ${status.provider_credential_ready === true ? "ready" : "missing"}`;
   return `preferences: ${groups} | ${enabled} | groups ${number(status.groups)} | rules ${number(status.rules)} | model ${model} | endpoint ${endpoint} | credential ${credential} | sync ${text(status.sync_state, "error")}`;
 }
 

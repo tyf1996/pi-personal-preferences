@@ -9,7 +9,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -17,6 +17,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from wikiskill_preference_core.classification import (  # noqa: E402
     PROMPT_VERSION as CLASSIFICATION_PROMPT_VERSION,
+    build_group_classification_prompt,
     classify_group,
 )
 from wikiskill_preference_core.config import PreferenceConfig  # noqa: E402
@@ -75,6 +76,30 @@ def _json_input() -> Any:
     if not isinstance(value, dict):
         raise PreferenceError("stdin JSON must be an object")
     return value
+
+
+def _json_line_input() -> dict[str, Any]:
+    try:
+        text = sys.stdin.readline()
+    except OSError as exc:
+        raise PreferenceError(f"cannot read stdin: {exc}") from exc
+    if not text.strip():
+        raise PreferenceError("stdin must contain a JSON object line")
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise PreferenceError(f"stdin line is not valid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise PreferenceError("stdin JSON line must be an object")
+    return value
+
+
+def _pi_model_response(prompt: str) -> Any:
+    print(json.dumps({"type": "model_request", "prompt": prompt}, ensure_ascii=False), flush=True)
+    value = _json_line_input()
+    if set(value) != {"model_response"}:
+        raise PreferenceError("Pi model bridge response must contain only model_response")
+    return value["model_response"]
 
 
 def _event_from_input(value: dict[str, Any]) -> tuple[PreferenceEvent, str | None]:
@@ -145,16 +170,24 @@ def _classification_request(store: PreferenceStore, value: dict[str, Any]) -> Gr
     return request
 
 
-def _classify_group(store: PreferenceStore, value: dict[str, Any]) -> dict[str, Any]:
+def _classify_group(
+    store: PreferenceStore,
+    value: dict[str, Any],
+    model_responder: Callable[[str], Any] | None = None,
+) -> dict[str, Any]:
     request = _classification_request(store, value)
     diagnostics: list[str] = []
     try:
-        result = classify_group(store.config, request, diagnostics=diagnostics)
+        model_response = (
+            model_responder(build_group_classification_prompt(request))
+            if model_responder is not None else None
+        )
+        result = classify_group(store.config, request, model_response=model_response, diagnostics=diagnostics)
     except PreferenceError as exc:
         store.write_last_run({
             "ok": False,
             "stage": "classification",
-            "model": f"{store.config.provider['name']}/{store.config.provider['model']}",
+            "model": store.config.model_identity(),
             "prompt_version": CLASSIFICATION_PROMPT_VERSION,
             "error": sanitize_text(str(exc)).text[:500],
         })
@@ -163,7 +196,7 @@ def _classify_group(store: PreferenceStore, value: dict[str, Any]) -> dict[str, 
         "ok": True,
         "stage": "classification",
         "group": result.group,
-        "model": f"{store.config.provider['name']}/{store.config.provider['model']}",
+        "model": store.config.model_identity(),
         "prompt_version": CLASSIFICATION_PROMPT_VERSION,
         **({"diagnostics": diagnostics} if diagnostics else {}),
     })
@@ -255,7 +288,11 @@ def _diff_line_counts(raw_diff: str) -> tuple[int, int]:
     return added, removed
 
 
-def _changed(store: PreferenceStore, value: dict[str, Any]) -> dict[str, Any]:
+def _changed(
+    store: PreferenceStore,
+    value: dict[str, Any],
+    model_responder: Callable[[str], Any] | None = None,
+) -> dict[str, Any]:
     if not store.config.enabled:
         return {"ok": True, "changed": False, "stored": False, "disabled": True, "events": []}
     required = {"task_id", "paths", "agent_hashes", "current_hashes", "task_summary"}
@@ -336,7 +373,11 @@ def _changed(store: PreferenceStore, value: dict[str, Any]) -> dict[str, Any]:
         ],
     })
     try:
-        classification = classify_group(store.config, request)
+        model_response = (
+            model_responder(build_group_classification_prompt(request))
+            if model_responder is not None else None
+        )
+        classification = classify_group(store.config, request, model_response=model_response)
     except PreferenceError as exc:
         store.write_last_run({
             "ok": False,
@@ -525,10 +566,21 @@ def _status(store: PreferenceStore) -> dict[str, Any]:
     pending = _pending_evidence(store)
     model_ready, model_status = store.config.model_readiness()
     provider = store.config.provider
-    is_fake = provider["name"] == "fake"
-    base_url_ready = is_fake or bool(provider.get("base_url") or os.environ.get("OPENAI_BASE_URL"))
-    credential_env = str(provider["api_key_env"])
-    credential_ready = is_fake or bool(os.environ.get(credential_env))
+    if provider["name"] == "pi":
+        provider_name = os.environ.get("PI_PREFERENCE_PI_PROVIDER", "pi")
+        provider_model = os.environ.get("PI_PREFERENCE_PI_MODEL", "current")
+        base_url_ready = model_ready
+        credential_env = "Pi credential store"
+        credential_ready = model_ready
+        provider_source = "pi"
+    else:
+        is_fake = provider["name"] == "fake"
+        provider_name = str(provider["name"])
+        provider_model = str(provider["model"])
+        base_url_ready = is_fake or bool(provider.get("base_url") or os.environ.get("OPENAI_BASE_URL"))
+        credential_env = str(provider["api_key_env"])
+        credential_ready = is_fake or bool(os.environ.get(credential_env))
+        provider_source = "custom"
     return {
         "ok": True,
         "enabled": store.config.enabled,
@@ -539,8 +591,11 @@ def _status(store: PreferenceStore) -> dict[str, Any]:
         "evolve_due": store.config.enabled and model_ready and len(pending) >= store.config.auto_evolve_after,
         "model_ready": model_ready,
         "model_status": model_status,
-        "provider_name": provider["name"],
-        "provider_model": provider["model"],
+        "provider_source": provider_source,
+        "provider_name": provider_name,
+        "provider_model": provider_model,
+        "provider_thinking_level": store.config.effective_thinking_level(),
+        "provider_timeout_seconds": float(provider.get("timeout_seconds", 60)),
         "provider_base_url_ready": base_url_ready,
         "provider_credential_env": credential_env,
         "provider_credential_ready": credential_ready,
@@ -610,6 +665,7 @@ def build_parser() -> argparse.ArgumentParser:
     changed = commands.add_parser("changed", help="record touched-file user edits through stdin")
     data_root(changed)
     changed.add_argument("--stdin", action="store_true", required=True)
+    changed.add_argument("--pi-model", action="store_true", help=argparse.SUPPRESS)
 
     remember = commands.add_parser("remember", help="write a rule to an existing group through stdin")
     data_root(remember)
@@ -618,10 +674,12 @@ def build_parser() -> argparse.ArgumentParser:
     classify = commands.add_parser("classify-group", help="classify a preference into an existing group through stdin")
     data_root(classify)
     classify.add_argument("--stdin", action="store_true", required=True)
+    classify.add_argument("--pi-model", action="store_true", help=argparse.SUPPRESS)
 
     evolve = commands.add_parser("evolve", help="update group rules from new evidence")
     data_root(evolve)
     evolve.add_argument("--dry-run", action="store_true")
+    evolve.add_argument("--pi-model", action="store_true", help=argparse.SUPPRESS)
 
     status = commands.add_parser("status", help="show personal preference group status")
     data_root(status)
@@ -664,13 +722,25 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "capture":
         return _capture(store, _json_input())
     if args.command == "changed":
-        return _changed(store, _json_input())
+        if args.pi_model and store.config.provider["name"] != "pi":
+            raise PreferenceError("--pi-model requires provider.name=pi")
+        reader = _json_line_input if args.pi_model else _json_input
+        return _changed(store, reader(), _pi_model_response if args.pi_model else None)
     if args.command == "remember":
         return _remember(store, _json_input())
     if args.command == "classify-group":
-        return _classify_group(store, _json_input())
+        if args.pi_model and store.config.provider["name"] != "pi":
+            raise PreferenceError("--pi-model requires provider.name=pi")
+        reader = _json_line_input if args.pi_model else _json_input
+        return _classify_group(store, reader(), _pi_model_response if args.pi_model else None)
     if args.command == "evolve":
-        return evolve_preferences(store.root, dry_run=args.dry_run)
+        if args.pi_model and store.config.provider["name"] != "pi":
+            raise PreferenceError("--pi-model requires provider.name=pi")
+        return evolve_preferences(
+            store.root,
+            dry_run=args.dry_run,
+            model_responder=_pi_model_response if args.pi_model else None,
+        )
     if args.command == "status":
         return _status(store)
     if args.command == "settings":

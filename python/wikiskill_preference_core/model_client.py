@@ -17,6 +17,15 @@ from .sanitizing import sanitize_text
 MAX_RESPONSE_BYTES = 512 * 1024
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+def _open_without_redirect(request: urllib.request.Request, timeout: float):
+    return urllib.request.build_opener(_NoRedirectHandler()).open(request, timeout=timeout)
+
+
 def openai_endpoint(base_url: str) -> str:
     base = base_url.rstrip("/")
     if base.endswith("/chat/completions"):
@@ -42,6 +51,8 @@ def call_openai_compatible(config: PreferenceConfig, prompt: str) -> str:
     """Call the configured OpenAI-compatible endpoint without exposing secrets."""
 
     provider = config.provider
+    if provider["name"] == "pi":
+        raise PreferenceEvolutionError("Pi model calls must be bridged through the Pi extension")
     api_key_env = str(provider["api_key_env"])
     api_key = os.environ.get(api_key_env)
     if not api_key:
@@ -62,6 +73,9 @@ def call_openai_compatible(config: PreferenceConfig, prompt: str) -> str:
         "max_tokens": provider.get("max_tokens", 2048),
         "response_format": {"type": "json_object"},
     }
+    thinking_level = str(provider["thinking_level"])
+    if thinking_level != "off":
+        request_body["reasoning_effort"] = thinking_level
     request = urllib.request.Request(
         openai_endpoint(endpoint),
         data=stable_json_dumps(request_body).encode("utf-8"),
@@ -70,7 +84,7 @@ def call_openai_compatible(config: PreferenceConfig, prompt: str) -> str:
     )
     timeout = float(provider.get("timeout_seconds", 60))
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _open_without_redirect(request, timeout) as response:
             payload = response.read(MAX_RESPONSE_BYTES + 1)
     except (OSError, urllib.error.URLError, TimeoutError) as exc:
         # urllib errors can contain deployment-specific details. Keep the

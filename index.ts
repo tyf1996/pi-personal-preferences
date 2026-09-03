@@ -12,7 +12,7 @@ import type {
   ExtensionCommandContext,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { runPreferenceCli } from "./src/cli-client.ts";
+import { runPreferenceCli, runPreferenceCliWithModel } from "./src/cli-client.ts";
 import {
   parsePrefCommand,
   preferenceCommandNames,
@@ -29,6 +29,12 @@ import {
   type PreferenceGroup,
   type PreferenceStatus,
 } from "./src/dashboard.ts";
+import {
+  completeWithPiModel,
+  piModelEnvironment,
+  THINKING_LEVELS,
+  type ConfiguredPiThinkingLevel,
+} from "./src/pi-model.ts";
 
 const baseDir = dirname(fileURLToPath(import.meta.url));
 const CLI_NAME = "wikiskill_preference.py";
@@ -38,6 +44,12 @@ interface RepoLayout {
   enabled: boolean;
   captureUserEdits: boolean;
   autoEvolve: boolean;
+  provider: {
+    mode: "pi" | "custom";
+    name: string;
+    thinkingLevel: ConfiguredPiThinkingLevel;
+    timeoutMs: number;
+  };
 }
 
 interface TouchedFile {
@@ -99,6 +111,30 @@ function readLayout(): RepoLayout | undefined {
       || typeof value.git_auto_push !== "boolean"
       || typeof value.capture_user_edits !== "boolean"
     ) return undefined;
+    const provider = value.provider;
+    if (!provider || typeof provider !== "object" || Array.isArray(provider)) return undefined;
+    const providerRecord = provider as Record<string, unknown>;
+    if (typeof providerRecord.name !== "string") return undefined;
+    const legacyProviderKeys = Object.keys(providerRecord).sort().join("\u0000");
+    const legacyPiDefault = legacyProviderKeys === ["api_key_env", "model", "name"].sort().join("\u0000")
+      && providerRecord.name === "openai_compatible"
+      && providerRecord.model === "configured-model"
+      && providerRecord.api_key_env === "PREFERENCE_MODEL_API_KEY";
+    const piMode = providerRecord.name === "pi" || legacyPiDefault;
+    const thinkingLevel = typeof providerRecord.thinking_level === "string"
+      ? providerRecord.thinking_level
+      : piMode ? "inherit" : "medium";
+    const validThinking = THINKING_LEVELS.includes(thinkingLevel as (typeof THINKING_LEVELS)[number]);
+    if (piMode ? thinkingLevel !== "inherit" && !validThinking : !validThinking) return undefined;
+    const timeoutSeconds = providerRecord.timeout_seconds === undefined && piMode
+      ? 300
+      : providerRecord.timeout_seconds;
+    if (piMode && (
+      typeof timeoutSeconds !== "number"
+      || !Number.isFinite(timeoutSeconds)
+      || timeoutSeconds <= 0
+    )) return undefined;
+
     const repoParts = value.repo_path.split("/");
     if (
       !value.repo_path.trim()
@@ -117,6 +153,12 @@ function readLayout(): RepoLayout | undefined {
       enabled: value.enabled,
       captureUserEdits: value.capture_user_edits,
       autoEvolve: value.auto_evolve,
+      provider: {
+        mode: piMode ? "pi" : "custom",
+        name: piMode ? "pi" : providerRecord.name,
+        thinkingLevel: thinkingLevel as ConfiguredPiThinkingLevel,
+        timeoutMs: piMode ? Number(timeoutSeconds) * 1000 : 60_000,
+      },
     };
   } catch {
     return undefined;
@@ -232,11 +274,35 @@ function event(
   };
 }
 
+const PI_MODEL_COMMANDS = new Set(["changed", "classify-group", "evolve"]);
+
 async function invoke(
   args: string[],
   input?: unknown,
   timeoutMs = 60_000,
+  ctx?: ExtensionContext,
 ): Promise<Record<string, unknown>> {
+  const layout = readLayout();
+  if (layout?.provider.mode === "pi" && ctx) {
+    const modelCommand = PI_MODEL_COMMANDS.has(args[0] ?? "");
+    const environment = await piModelEnvironment(
+      ctx,
+      layout.provider.thinkingLevel,
+      args[0] === "status",
+    );
+    if (modelCommand) {
+      return runPreferenceCliWithModel(
+        cliPath(),
+        preferenceDataRoot(),
+        args,
+        input,
+        (prompt, signal) => completeWithPiModel(ctx, layout.provider.thinkingLevel, prompt, signal),
+        layout.provider.timeoutMs,
+        environment,
+      );
+    }
+    return runPreferenceCli(cliPath(), preferenceDataRoot(), args, input, timeoutMs, environment);
+  }
   return runPreferenceCli(cliPath(), preferenceDataRoot(), args, input, timeoutMs);
 }
 
@@ -317,17 +383,18 @@ export function preferenceExtension(pi: ExtensionAPI): void {
   let lastPendingEvidenceCount: number | undefined;
   const pendingWrites = new Map<string, string>();
 
-  const invokeCli: PreferenceCliInvoker = (args, input, timeoutMs) => invoke(args, input, timeoutMs);
+  const invokeFor = (ctx: ExtensionContext): PreferenceCliInvoker =>
+    (args, input, timeoutMs) => invoke(args, input, timeoutMs, ctx);
 
   async function updateStatus(ctx: ExtensionContext): Promise<PreferenceStatus | undefined> {
     try {
-      const result = await invoke(["status"]);
+      const result = await invoke(["status"], undefined, 60_000, ctx);
       let effectiveGroups: string[] = [];
       try {
         const context = await invoke(["context", "--stdin"], {
           directory: resolve(ctx.cwd),
           session_id: sessionId(ctx),
-        });
+        }, 60_000, ctx);
         if (Array.isArray(context.effective_groups)) {
           effectiveGroups = context.effective_groups.filter((name): name is string => typeof name === "string");
         }
@@ -357,7 +424,7 @@ export function preferenceExtension(pi: ExtensionAPI): void {
         autoEvolveBlocked = false;
       }
       if (!status?.evolve_due || autoEvolveBlocked || ctx.hasPendingMessages()) return;
-      await invoke(["evolve"], undefined, 15 * 60 * 1000);
+      await invoke(["evolve"], undefined, 15 * 60 * 1000, ctx);
       await updateStatus(ctx);
     } catch (error) {
       diagnostic = error instanceof Error ? error.message : String(error);
@@ -380,7 +447,7 @@ export function preferenceExtension(pi: ExtensionAPI): void {
         agent_hashes: state.agentHashes,
         current_hashes: state.currentHashes,
         diffs: state.diffs,
-      });
+      }, 60_000, ctx);
     } catch (error) {
       diagnostic = error instanceof Error ? error.message : String(error);
       return undefined;
@@ -477,7 +544,7 @@ export function preferenceExtension(pi: ExtensionAPI): void {
       const context = await invoke(["context", "--stdin"], {
         directory: resolve(ctx.cwd),
         session_id: sessionId(ctx),
-      });
+      }, 60_000, ctx);
       const effective = Array.isArray(context.effective_groups)
         ? context.effective_groups.filter((name): name is string => typeof name === "string")
         : [];
@@ -500,6 +567,7 @@ export function preferenceExtension(pi: ExtensionAPI): void {
     ctx: ExtensionCommandContext,
   ): Promise<void> {
     const groups = await readGroups();
+    const invokeCli = invokeFor(ctx);
     const group = await resolvePreferenceGroup({
       explicitGroup: command.group,
       preferenceText: command.rule,
@@ -513,7 +581,7 @@ export function preferenceExtension(pi: ExtensionAPI): void {
       group,
       rule: command.rule,
       task_id: null,
-    });
+    }, 60_000, ctx);
     const message = result.duplicate === true
       ? `规则已存在于 ${group}：`
       : result.restored === true
@@ -542,6 +610,7 @@ export function preferenceExtension(pi: ExtensionAPI): void {
     const taskRef = task?.taskId ?? `task-${hashText(sessionId(ctx)).slice(0, 24)}`;
     const summary = reason?.trim() || "用户对当前结果表示满意";
     const groups = await readGroups();
+    const invokeCli = invokeFor(ctx);
     const group = await resolvePreferenceGroup({
       explicitGroup: command.group,
       preferenceText: summary,
@@ -552,7 +621,12 @@ export function preferenceExtension(pi: ExtensionAPI): void {
       invokeCli,
     });
     const signal = sentiment === "good" ? "acceptance" : "rejection";
-    const result = await invoke(["capture", "--stdin"], event(group, signal, summary, taskRef));
+    const result = await invoke(
+      ["capture", "--stdin"],
+      event(group, signal, summary, taskRef),
+      60_000,
+      ctx,
+    );
     safeNotify(ctx, `反馈：${sentiment === "good" ? "满意" : "需要改进"} · ${group} · ${result.stored === false ? "duplicate" : "stored"}`, "info");
   }
 
@@ -581,7 +655,7 @@ export function preferenceExtension(pi: ExtensionAPI): void {
           throw new Error("个人偏好系统已停用；仍可使用 /pref 查看和管理偏好组");
         }
         if (command.action === "dashboard") {
-          await showPreferenceDashboard(ctx, invokeCli, {
+          await showPreferenceDashboard(ctx, invokeFor(ctx), {
             remember: async (rule) => handleRemember({ action: "remember", rule }, ctx),
             feedback: async () => handleFeedback({ action: "feedback" }, ctx),
             sessionId: sessionId(ctx),

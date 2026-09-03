@@ -26,8 +26,19 @@ CONFIG_KEYS = {
     "git_auto_push",
     "provider",
 }
-PROVIDER_KEYS = {"name", "model", "api_key_env", "base_url", "temperature", "max_tokens", "timeout_seconds"}
+PROVIDER_KEYS = {
+    "name", "model", "api_key_env", "base_url", "temperature", "max_tokens", "timeout_seconds",
+    "thinking_level",
+}
+THINKING_LEVELS = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
+PI_THINKING_LEVELS = {"inherit", *THINKING_LEVELS}
+DEFAULT_PI_TIMEOUT_SECONDS = 300.0
 ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+LEGACY_DEFAULT_PROVIDER = {
+    "name": "openai_compatible",
+    "model": "configured-model",
+    "api_key_env": "PREFERENCE_MODEL_API_KEY",
+}
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "schema_version": SCHEMA_VERSION,
@@ -39,9 +50,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "auto_evolve_after": 10,
     "git_auto_push": False,
     "provider": {
-        "name": "openai_compatible",
-        "model": "configured-model",
-        "api_key_env": "PREFERENCE_MODEL_API_KEY",
+        "name": "pi",
+        "thinking_level": "inherit",
+        "timeout_seconds": DEFAULT_PI_TIMEOUT_SECONDS,
     },
 }
 
@@ -139,58 +150,91 @@ class PreferenceConfig:
         data = _strict(value, CONFIG_KEYS, CONFIG_KEYS, "preference config")
         if type(data["schema_version"]) is not int or data["schema_version"] != SCHEMA_VERSION:
             raise PreferenceConfigError("preference config schema_version must be 1")
-        provider = _strict(data["provider"], {"name", "model", "api_key_env"}, PROVIDER_KEYS, "provider")
-        name = provider["name"]
-        if not isinstance(name, str) or name not in {"fake", "openai_compatible"}:
+        raw_provider = _object(data["provider"], "provider")
+        name = raw_provider.get("name")
+        if not isinstance(name, str) or name not in {"pi", "fake", "openai_compatible"}:
             raise PreferenceConfigError(f"provider.name is unsupported: {name!r}")
-        model = provider["model"]
-        if not isinstance(model, str) or not model.strip():
-            raise PreferenceConfigError("provider.model must be a non-empty string")
-        api_key_env = provider["api_key_env"]
-        if not isinstance(api_key_env, str) or not ENV_RE.fullmatch(api_key_env):
-            raise PreferenceConfigError("provider.api_key_env must be an environment variable name")
-        base_url = provider.get("base_url")
-        if base_url is not None:
-            if not isinstance(base_url, str) or not base_url.startswith(("http://", "https://")):
-                raise PreferenceConfigError("provider.base_url must be an HTTP(S) URL")
-            try:
-                parsed_base_url = urlsplit(base_url)
-                invalid_base_url = (
-                    not parsed_base_url.netloc
-                    or parsed_base_url.username is not None
-                    or parsed_base_url.password is not None
-                    or parsed_base_url.query
-                    or parsed_base_url.fragment
-                )
-            except ValueError as exc:
-                raise PreferenceConfigError("provider.base_url is malformed") from exc
-            if invalid_base_url:
-                raise PreferenceConfigError("provider.base_url must not contain credentials, query, or fragment")
-        normalized_provider = dict(provider)
-        if "temperature" in normalized_provider:
-            temperature_value = normalized_provider["temperature"]
-            if isinstance(temperature_value, bool) or not isinstance(temperature_value, (int, float)):
-                raise PreferenceConfigError("provider.temperature must be numeric")
-            try:
-                temperature = float(temperature_value)
-            except (TypeError, ValueError) as exc:
-                raise PreferenceConfigError("provider.temperature must be numeric") from exc
-            if not math.isfinite(temperature) or not 0 <= temperature <= 2:
-                raise PreferenceConfigError("provider.temperature must be within 0..2")
-            normalized_provider["temperature"] = temperature
-        if "max_tokens" in normalized_provider:
-            normalized_provider["max_tokens"] = _positive_int(normalized_provider["max_tokens"], "provider.max_tokens")
-        if "timeout_seconds" in normalized_provider:
-            timeout_value = normalized_provider["timeout_seconds"]
+        if name == "pi":
+            provider = _strict(
+                raw_provider,
+                {"name", "thinking_level"},
+                {"name", "thinking_level", "timeout_seconds"},
+                "provider",
+            )
+            thinking_level = provider["thinking_level"]
+            if not isinstance(thinking_level, str) or thinking_level not in PI_THINKING_LEVELS:
+                raise PreferenceConfigError(f"provider.thinking_level is unsupported: {thinking_level!r}")
+            timeout_value = provider.get("timeout_seconds", DEFAULT_PI_TIMEOUT_SECONDS)
             if isinstance(timeout_value, bool) or not isinstance(timeout_value, (int, float)):
                 raise PreferenceConfigError("provider.timeout_seconds must be numeric")
-            try:
-                timeout = float(timeout_value)
-            except (TypeError, ValueError) as exc:
-                raise PreferenceConfigError("provider.timeout_seconds must be numeric") from exc
+            timeout = float(timeout_value)
             if not math.isfinite(timeout) or timeout <= 0:
                 raise PreferenceConfigError("provider.timeout_seconds must be positive")
-            normalized_provider["timeout_seconds"] = timeout
+            normalized_provider = {
+                "name": "pi",
+                "thinking_level": thinking_level,
+                "timeout_seconds": timeout,
+            }
+        else:
+            provider = _strict(
+                raw_provider,
+                {"name", "model", "api_key_env", "thinking_level"},
+                PROVIDER_KEYS,
+                "provider",
+            )
+            model = provider["model"]
+            if not isinstance(model, str) or not model.strip():
+                raise PreferenceConfigError("provider.model must be a non-empty string")
+            api_key_env = provider["api_key_env"]
+            if not isinstance(api_key_env, str) or not ENV_RE.fullmatch(api_key_env):
+                raise PreferenceConfigError("provider.api_key_env must be an environment variable name")
+            thinking_level = provider["thinking_level"]
+            if not isinstance(thinking_level, str) or thinking_level not in THINKING_LEVELS:
+                raise PreferenceConfigError(f"provider.thinking_level is unsupported: {thinking_level!r}")
+            base_url = provider.get("base_url")
+            if base_url is not None:
+                if not isinstance(base_url, str) or not base_url.startswith(("http://", "https://")):
+                    raise PreferenceConfigError("provider.base_url must be an HTTP(S) URL")
+                try:
+                    parsed_base_url = urlsplit(base_url)
+                    invalid_base_url = (
+                        not parsed_base_url.netloc
+                        or parsed_base_url.username is not None
+                        or parsed_base_url.password is not None
+                        or parsed_base_url.query
+                        or parsed_base_url.fragment
+                    )
+                except ValueError as exc:
+                    raise PreferenceConfigError("provider.base_url is malformed") from exc
+                if invalid_base_url:
+                    raise PreferenceConfigError("provider.base_url must not contain credentials, query, or fragment")
+            normalized_provider = dict(provider)
+            if "temperature" in normalized_provider:
+                temperature_value = normalized_provider["temperature"]
+                if isinstance(temperature_value, bool) or not isinstance(temperature_value, (int, float)):
+                    raise PreferenceConfigError("provider.temperature must be numeric")
+                try:
+                    temperature = float(temperature_value)
+                except (TypeError, ValueError) as exc:
+                    raise PreferenceConfigError("provider.temperature must be numeric") from exc
+                if not math.isfinite(temperature) or not 0 <= temperature <= 2:
+                    raise PreferenceConfigError("provider.temperature must be within 0..2")
+                normalized_provider["temperature"] = temperature
+            if "max_tokens" in normalized_provider:
+                normalized_provider["max_tokens"] = _positive_int(
+                    normalized_provider["max_tokens"], "provider.max_tokens",
+                )
+            if "timeout_seconds" in normalized_provider:
+                timeout_value = normalized_provider["timeout_seconds"]
+                if isinstance(timeout_value, bool) or not isinstance(timeout_value, (int, float)):
+                    raise PreferenceConfigError("provider.timeout_seconds must be numeric")
+                try:
+                    timeout = float(timeout_value)
+                except (TypeError, ValueError) as exc:
+                    raise PreferenceConfigError("provider.timeout_seconds must be numeric") from exc
+                if not math.isfinite(timeout) or timeout <= 0:
+                    raise PreferenceConfigError("provider.timeout_seconds must be positive")
+                normalized_provider["timeout_seconds"] = timeout
         return cls(
             data_root=root,
             schema_version=SCHEMA_VERSION,
@@ -218,15 +262,33 @@ class PreferenceConfig:
             raise PreferenceConfigError(f"preference config does not exist: {path}") from exc
         except (OSError, json.JSONDecodeError) as exc:
             raise PreferenceConfigError(f"cannot read preference config: {path}: {exc}") from exc
-        if isinstance(raw, dict) and "sync_evidence" in raw:
-            legacy = dict(raw)
-            value = legacy.pop("sync_evidence")
+        migrated = dict(raw) if isinstance(raw, dict) else raw
+        changed = False
+        if isinstance(migrated, dict) and "sync_evidence" in migrated:
+            value = migrated.pop("sync_evidence")
             if not isinstance(value, bool):
                 raise PreferenceConfigError("legacy sync_evidence must be a boolean")
-            config = cls.from_dict(legacy, root)
+            changed = True
+        if isinstance(migrated, dict) and isinstance(migrated.get("provider"), dict):
+            provider = dict(migrated["provider"])
+            if provider == LEGACY_DEFAULT_PROVIDER:
+                migrated["provider"] = dict(DEFAULT_CONFIG["provider"])
+                changed = True
+            elif provider.get("name") == "pi":
+                original_provider = dict(provider)
+                provider.setdefault("thinking_level", "inherit")
+                provider.setdefault("timeout_seconds", DEFAULT_PI_TIMEOUT_SECONDS)
+                if provider != original_provider:
+                    migrated["provider"] = provider
+                    changed = True
+            elif provider.get("name") in {"fake", "openai_compatible"} and "thinking_level" not in provider:
+                provider["thinking_level"] = "medium"
+                migrated["provider"] = provider
+                changed = True
+        config = cls.from_dict(migrated, root)
+        if changed:
             _atomic_write_text(path, stable_json_dumps(config.to_dict()) + "\n")
-            return config
-        return cls.from_dict(raw, root)
+        return config
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -241,14 +303,34 @@ class PreferenceConfig:
             "provider": dict(self.provider),
         }
 
+    def effective_thinking_level(self, environment: Mapping[str, str] | None = None) -> str:
+        values = os.environ if environment is None else environment
+        configured = str(self.provider["thinking_level"])
+        if self.provider["name"] == "pi" and configured == "inherit":
+            inherited = values.get("PI_PREFERENCE_PI_THINKING", "off")
+            return inherited if inherited in THINKING_LEVELS else "off"
+        return configured
+
+    def model_identity(self, environment: Mapping[str, str] | None = None) -> str:
+        values = os.environ if environment is None else environment
+        if self.provider["name"] == "pi":
+            provider = values.get("PI_PREFERENCE_PI_PROVIDER")
+            model = values.get("PI_PREFERENCE_PI_MODEL")
+            return f"{provider}/{model}" if provider and model else "pi/current"
+        return f"{self.provider['name']}/{self.provider['model']}"
+
     def model_readiness(self, environment: Mapping[str, str] | None = None) -> tuple[bool, str]:
         """Return whether automatic classification and evolution can call the configured model."""
 
+        values = os.environ if environment is None else environment
+        if self.provider["name"] == "pi":
+            if not values.get("PI_PREFERENCE_PI_PROVIDER") or not values.get("PI_PREFERENCE_PI_MODEL"):
+                return False, "Pi model context is unavailable; run through the Pi extension"
+            if values.get("PI_PREFERENCE_PI_AUTH_READY") != "1":
+                return False, "the active Pi model has no configured authentication"
+            return True, "ready"
         if self.provider["name"] == "fake":
             return True, "ready"
-        if self.provider["model"] == DEFAULT_CONFIG["provider"]["model"]:
-            return False, "provider.model is not configured"
-        values = os.environ if environment is None else environment
         base_url = self.provider.get("base_url") or values.get("OPENAI_BASE_URL")
         if not isinstance(base_url, str) or not base_url.strip():
             return False, "provider.base_url or OPENAI_BASE_URL is missing"

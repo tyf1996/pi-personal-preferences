@@ -7,7 +7,7 @@ import json
 import os
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .config import PreferenceConfig
 from .contracts import (
@@ -184,10 +184,6 @@ def _groups_diff(repo: Path, groups: list[PreferenceGroup]) -> str:
     ))
 
 
-def _model_name(config: PreferenceConfig) -> str:
-    return f"{config.provider['name']}/{config.provider['model']}"
-
-
 def _read_fake_evolution_response() -> Any:
     fixture = os.environ.get("PREFERENCE_MODEL_RESPONSE")
     if fixture is None:
@@ -202,6 +198,7 @@ def evolve_preferences(
     *,
     dry_run: bool = False,
     model_response: Any | None = None,
+    model_responder: Callable[[str], Any] | None = None,
 ) -> dict[str, Any]:
     store = PreferenceStore(data_root)
     config = store.config
@@ -268,6 +265,8 @@ def evolve_preferences(
         prompt = build_evolver_prompt(events, groups)
         if model_response is not None:
             raw_response = model_response
+        elif model_responder is not None:
+            raw_response = model_responder(prompt)
         elif config.provider["name"] == "fake":
             raw_response = _read_fake_evolution_response()
         else:
@@ -283,7 +282,7 @@ def evolve_preferences(
         store.write_last_run({
             "ok": True,
             "stage": "model_response",
-            "model": _model_name(config),
+            "model": config.model_identity(),
             "prompt_version": PROMPT_VERSION,
             "new_evidence": len(events),
             "response_path": str(response_path),
@@ -300,7 +299,7 @@ def evolve_preferences(
             "new_evidence": len(events),
             "commit": None,
             "reload_required": False,
-            "model": _model_name(config),
+            "model": config.model_identity(),
             **sync_result,
         }
         if dry_run:
@@ -310,7 +309,7 @@ def evolve_preferences(
 
         if changed:
             store.write_groups(new_groups)
-        store.write_version(cursors=cursors, model=_model_name(config))
+        store.write_version(cursors=cursors, model=config.model_identity())
         result["commit"] = commit_generated(store.repo, "personal-preferences: generated")
         if not result["commit"]:
             raise PreferenceGitError("preference evolution did not create a Git commit")

@@ -14,7 +14,7 @@
 推荐安装固定的 GitHub Release：
 
 ```bash
-pi install git:github.com/tyf1996/pi-personal-preferences@v0.1.0
+pi install git:github.com/tyf1996/pi-personal-preferences@v0.2.0
 ```
 
 从独立仓库 checkout 安装当前目录：
@@ -55,7 +55,7 @@ pi list
 升级到新的固定版本：
 
 ```bash
-pi install git:github.com/tyf1996/pi-personal-preferences@v0.2.0
+pi install git:github.com/tyf1996/pi-personal-preferences@v0.3.0
 ```
 
 移除扩展：
@@ -94,24 +94,50 @@ $PI_CODING_AGENT_DIR/personal-preferences/
 
 ## 配置归组与自动演化模型
 
-编辑 `personal-preferences/config.json` 中的 `provider`。OpenAI-compatible 配置示例：
+默认配置直接复用当前 Pi 会话选择的模型、凭据和 endpoint：
+
+```json
+{
+  "name": "pi",
+  "thinking_level": "inherit",
+  "timeout_seconds": 300
+}
+```
+
+`inherit` 表示跟随 Pi 当前会话的 thinking level；使用 `/model` 切换模型后，扩展随当前模型切换。Pi 的凭据由 model registry 在调用时解析，不会写入个人偏好配置，也不会序列化到 TypeScript 与 Python CLI 之间的模型桥接协议。
+
+Pi 模式也可以为偏好归组和演化固定独立的 thinking level：
+
+```json
+{
+  "name": "pi",
+  "thinking_level": "medium",
+  "timeout_seconds": 300
+}
+```
+
+可用值为 `inherit`、`off`、`minimal`、`low`、`medium`、`high`、`xhigh` 和 `max`。实际支持范围取决于当前 Pi 模型；不支持 reasoning 的模型按 `off` 调用。`timeout_seconds` 是 Pi 模型桥接的总超时，默认 300 秒；高 thinking 模型需要更长时间时可以调大。
+
+如需使用独立于 Pi 的 OpenAI-compatible 模型，将 `personal-preferences/config.json` 中的 `provider` 改为：
 
 ```json
 {
   "name": "openai_compatible",
   "model": "your-model-name",
   "api_key_env": "PREFERENCE_MODEL_API_KEY",
-  "base_url": "https://your-provider.example/v1"
+  "base_url": "https://your-provider.example/v1",
+  "thinking_level": "high",
+  "timeout_seconds": 120
 }
 ```
 
-设置配置中声明的凭据环境变量，然后重新启动 Pi：
+自定义模式的 thinking level 可用值为 `off`、`minimal`、`low`、`medium`、`high`、`xhigh` 和 `max`。除 `off` 外，该值通过 OpenAI-compatible 请求的 `reasoning_effort` 字段发送，endpoint 必须支持所选值。设置配置中声明的凭据环境变量后重新启动 Pi：
 
 ```bash
 export PREFERENCE_MODEL_API_KEY='your-api-key'
 ```
 
-`/pref` 摘要会显示 provider、model、endpoint readiness、credential 环境变量名称及 readiness。全部 ready 后，未指定 `--group` 的 remember、feedback、文件修改归组和自动演化才会调用模型。
+旧版未修改的 `configured-model` 占位配置会自动迁移到 Pi 模式；已有自定义模型配置会保留，并补入 `thinking_level: "medium"`。`/pref` 摘要会显示模型来源、provider、model、thinking level、timeout 和 readiness。模型 ready 后，未指定 `--group` 的 remember、feedback、文件修改归组和自动演化会调用模型。
 
 ## 配置 GitHub 同步
 
