@@ -95,24 +95,56 @@ async function loadContext(
   };
 }
 
+function shorten(value: string, limit: number): string {
+  return value.length <= limit ? value : `${value.slice(0, Math.max(1, limit - 1))}…`;
+}
+
+function compactGroups(groups: string[]): string {
+  if (!groups.length) return "none";
+  const first = shorten(groups[0] ?? "none", 8);
+  return groups.length > 1 ? `${first}+${groups.length - 1}` : first;
+}
+
+function compactThinking(value: unknown): string {
+  const levels: Record<string, string> = {
+    off: "off",
+    minimal: "min",
+    low: "low",
+    medium: "med",
+    high: "high",
+    xhigh: "xh",
+    max: "max",
+  };
+  return levels[text(value, "off")] ?? "off";
+}
+
+function compactSync(value: unknown): string {
+  const state = text(value, "error");
+  if (state === "no-remote") return "local";
+  if (state === "clean") return "synced";
+  return shorten(state, 10);
+}
+
 export function formatPreferenceSummary(status: PreferenceStatus, effectiveGroups: string[] = []): string {
-  const visibleGroups = status.enabled === false ? [] : effectiveGroups;
-  const groups = visibleGroups.length ? visibleGroups.join(", ") : "none";
-  const enabled = status.enabled === false ? "disabled" : "enabled";
+  const groups = status.enabled === false ? "off" : compactGroups(effectiveGroups);
+  const counts = `${number(status.groups)}g/${number(status.rules)}r`;
+  const model = status.model_ready === true
+    ? `${shorten(text(status.provider_model, "model"), 16)}:${compactThinking(status.provider_thinking_level)}`
+    : "model!";
+  const pending = number(status.pending_evidence_count);
+  const evidence = pending > 0 ? ` · ${pending}e${status.evolve_due === true ? "!" : ""}` : "";
+  return `pref ${groups} · ${counts} · ${model}${evidence} · ${compactSync(status.sync_state)}`;
+}
+
+function formatPreferenceDetails(status: PreferenceStatus): string {
   const source = text(status.provider_source, "custom");
   const provider = `${text(status.provider_name, "unknown")}/${text(status.provider_model, "unknown")}`;
   const thinking = text(status.provider_thinking_level, "off");
   const timeout = number(status.provider_timeout_seconds);
   const model = status.model_ready === true
-    ? `ready (${source} ${provider}, thinking ${thinking}, timeout ${timeout}s)`
-    : `not ready (${source} ${provider}, thinking ${thinking}, timeout ${timeout}s: ${text(status.model_status, "not configured")})`;
-  const endpoint = source === "pi"
-    ? "Pi managed"
-    : status.provider_base_url_ready === true ? "ready" : "missing";
-  const credential = source === "pi"
-    ? "Pi managed"
-    : `${text(status.provider_credential_env, "unknown")} ${status.provider_credential_ready === true ? "ready" : "missing"}`;
-  return `preferences: ${groups} | ${enabled} | groups ${number(status.groups)} | rules ${number(status.rules)} | model ${model} | endpoint ${endpoint} | credential ${credential} | sync ${text(status.sync_state, "error")}`;
+    ? `${source} ${provider} · thinking ${thinking} · timeout ${timeout}s`
+    : `${source} ${provider} · 未就绪：${text(status.model_status, "未配置")}`;
+  return `模型：${model}\n同步：${text(status.sync_state, "error")}`;
 }
 
 function groupDetails(group: PreferenceGroup, context: ContextResult): string {
@@ -178,17 +210,20 @@ async function editDescription(
   ctx: ExtensionCommandContext,
   invokeCli: PreferenceCliInvoker,
 ): Promise<void> {
-  const groups = await loadGroups(invokeCli);
-  const group = await selectGroup(ctx, groups, "编辑组介绍");
-  if (!group) return;
-  const description = await ctx.ui.editor("编辑组介绍", group.description);
-  if (description === undefined) return;
-  if (!description.trim()) throw new Error("组介绍不能为空");
-  await manage(ctx, invokeCli, {
-    action: "update_description",
-    group: group.name,
-    description: description.trim(),
-  });
+  for (;;) {
+    const groups = await loadGroups(invokeCli);
+    const group = await selectGroup(ctx, groups, "编辑组介绍");
+    if (!group) return;
+    const description = await ctx.ui.editor("编辑组介绍", group.description);
+    if (description === undefined) continue;
+    if (!description.trim()) throw new Error("组介绍不能为空");
+    await manage(ctx, invokeCli, {
+      action: "update_description",
+      group: group.name,
+      description: description.trim(),
+    });
+    return;
+  }
 }
 
 async function deleteGroup(
@@ -206,58 +241,69 @@ async function manageRules(
   invokeCli: PreferenceCliInvoker,
   sessionId: string,
 ): Promise<void> {
-  const groups = await loadGroups(invokeCli);
-  const context = await loadContext(ctx, invokeCli, sessionId);
-  const group = await selectGroup(ctx, groups, "选择要管理的组");
-  if (!group) return;
-  const action = await ctx.ui.select("管理组内规则", [
-    "查看规则",
-    "增加规则",
-    "修改规则",
-    "删除规则",
-    "移动到其他组",
-    "取消",
-  ]);
-  if (!action || action === "取消") return;
-  if (action === "查看规则") {
-    ctx.ui.notify(groupDetails(group, context), "info");
-    return;
+  for (;;) {
+    const groups = await loadGroups(invokeCli);
+    const context = await loadContext(ctx, invokeCli, sessionId);
+    const group = await selectGroup(ctx, groups, "选择要管理的组");
+    if (!group) return;
+
+    for (;;) {
+      const action = await ctx.ui.select("管理组内规则", [
+        "查看规则",
+        "增加规则",
+        "修改规则",
+        "删除规则",
+        "移动到其他组",
+        "返回上一级",
+      ]);
+      if (!action || action === "返回上一级") break;
+      if (action === "查看规则") {
+        ctx.ui.notify(groupDetails(group, context), "info");
+        continue;
+      }
+      if (action === "增加规则") {
+        const rule = (await ctx.ui.input("增加规则", "输入组内规则"))?.trim();
+        if (!rule) continue;
+        await manage(ctx, invokeCli, { action: "add_rule", group: group.name, rule });
+        return;
+      }
+      if (!group.rules.length) {
+        ctx.ui.notify("当前组没有规则。", "info");
+        continue;
+      }
+
+      for (;;) {
+        const selected = await ctx.ui.select("选择规则", group.rules);
+        if (!selected) break;
+        if (action === "修改规则") {
+          const replacement = await ctx.ui.editor("修改规则", selected);
+          if (replacement === undefined) continue;
+          if (!replacement.trim()) throw new Error("规则不能为空");
+          await manage(ctx, invokeCli, {
+            action: "update_rule",
+            group: group.name,
+            rule: selected,
+            replacement: replacement.trim(),
+          });
+          return;
+        }
+        if (action === "删除规则") {
+          await manage(ctx, invokeCli, { action: "delete_rule", group: group.name, rule: selected });
+          return;
+        }
+        const targets = groups.filter((item) => item.name !== group.name);
+        const target = await selectGroup(ctx, targets, "移动到其他组");
+        if (!target) continue;
+        await manage(ctx, invokeCli, {
+          action: "move_rule",
+          source_group: group.name,
+          target_group: target.name,
+          rule: selected,
+        });
+        return;
+      }
+    }
   }
-  if (action === "增加规则") {
-    const rule = (await ctx.ui.input("增加规则", "输入组内规则"))?.trim();
-    if (rule) await manage(ctx, invokeCli, { action: "add_rule", group: group.name, rule });
-    return;
-  }
-  if (!group.rules.length) {
-    ctx.ui.notify("当前组没有规则。", "info");
-    return;
-  }
-  const selected = await ctx.ui.select("选择规则", group.rules);
-  if (!selected) return;
-  if (action === "修改规则") {
-    const replacement = await ctx.ui.editor("修改规则", selected);
-    if (replacement === undefined || !replacement.trim()) return;
-    await manage(ctx, invokeCli, {
-      action: "update_rule",
-      group: group.name,
-      rule: selected,
-      replacement: replacement.trim(),
-    });
-    return;
-  }
-  if (action === "删除规则") {
-    await manage(ctx, invokeCli, { action: "delete_rule", group: group.name, rule: selected });
-    return;
-  }
-  const targets = groups.filter((item) => item.name !== group.name);
-  const target = await selectGroup(ctx, targets, "移动到其他组");
-  if (!target) return;
-  await manage(ctx, invokeCli, {
-    action: "move_rule",
-    source_group: group.name,
-    target_group: target.name,
-    rule: selected,
-  });
 }
 
 async function setActivation(
@@ -289,85 +335,95 @@ export async function showPreferenceDashboard(
   invokeCli: PreferenceCliInvoker,
   actions: DashboardActions,
 ): Promise<void> {
-  const status = await invokeCli(["status"]) as PreferenceStatus;
-  const context = await loadContext(ctx, invokeCli, actions.sessionId);
-  if (!ctx.hasUI) {
-    ctx.ui.notify(formatPreferenceSummary(status, context.effective_groups), "info");
-    return;
-  }
-  const effectiveGroups = status.enabled === false ? [] : context.effective_groups;
-  ctx.ui.notify([
-    "个人偏好",
-    `当前有效：${effectiveGroups.join("、") || "无"}`,
-    formatPreferenceSummary(status, effectiveGroups),
-  ].join("\n"), "info");
-  const choice = await ctx.ui.select("个人偏好", [
-    "查看偏好组",
-    "创建偏好组",
-    "编辑组介绍",
-    "删除偏好组",
-    "管理组内规则",
-    "为当前目录启用组",
-    "为当前目录禁用组",
-    "为当前会话启用组",
-    "为当前会话禁用组",
-    "记录反馈",
-    "同步偏好仓库",
-    "撤销最近一次变化",
-  ]);
-  if (!choice) return;
-  if (choice === "查看偏好组") {
-    await viewGroups(ctx, invokeCli, actions.sessionId);
-    return;
-  }
-  if (choice === "创建偏好组") {
-    await createGroup(ctx, invokeCli);
-    return;
-  }
-  if (choice === "编辑组介绍") {
-    await editDescription(ctx, invokeCli);
-    return;
-  }
-  if (choice === "删除偏好组") {
-    await deleteGroup(ctx, invokeCli);
-    return;
-  }
-  if (choice === "管理组内规则") {
-    await manageRules(ctx, invokeCli, actions.sessionId);
-    return;
-  }
-  if (choice === "为当前目录启用组") {
-    await setActivation(ctx, invokeCli, actions.sessionId, "directory", true);
-    return;
-  }
-  if (choice === "为当前目录禁用组") {
-    await setActivation(ctx, invokeCli, actions.sessionId, "directory", false);
-    return;
-  }
-  if (choice === "为当前会话启用组") {
-    await setActivation(ctx, invokeCli, actions.sessionId, "session", true);
-    return;
-  }
-  if (choice === "为当前会话禁用组") {
-    await setActivation(ctx, invokeCli, actions.sessionId, "session", false);
-    return;
-  }
-  if (choice === "记录反馈") {
-    await actions.feedback();
-    return;
-  }
-  if (choice === "同步偏好仓库") {
-    const result = await invokeCli(["sync"], undefined, 120_000);
-    if (typeof result.push_error === "string") {
-      ctx.ui.notify(`本地偏好已提交，远端推送失败：${result.push_error}（${text(result.sync_state, "error")}）`, "warning");
-    } else {
-      ctx.ui.notify(`偏好同步完成：${text(result.sync_state, "unknown")}。`, "info");
+  let introShown = false;
+  for (;;) {
+    const status = await invokeCli(["status"]) as PreferenceStatus;
+    const context = await loadContext(ctx, invokeCli, actions.sessionId);
+    const effectiveGroups = status.enabled === false ? [] : context.effective_groups;
+    const summary = formatPreferenceSummary(status, effectiveGroups);
+    if (!ctx.hasUI) {
+      ctx.ui.notify(summary, "info");
+      return;
     }
-    return;
-  }
-  if (choice === "撤销最近一次变化") {
+    ctx.ui.setStatus(
+      "personal-preferences",
+      ctx.ui.theme.fg(status.enabled === false || status.model_ready === false ? "warning" : "accent", summary),
+    );
+    if (!introShown) {
+      ctx.ui.notify([
+        "个人偏好",
+        `当前有效：${effectiveGroups.join("、") || "无"}`,
+        formatPreferenceDetails(status),
+      ].join("\n"), "info");
+      introShown = true;
+    }
+
+    const choice = await ctx.ui.select("个人偏好", [
+      "查看偏好组",
+      "创建偏好组",
+      "编辑组介绍",
+      "删除偏好组",
+      "管理组内规则",
+      "为当前目录启用组",
+      "为当前目录禁用组",
+      "为当前会话启用组",
+      "为当前会话禁用组",
+      "记录反馈",
+      "同步偏好仓库",
+      "撤销最近一次变化",
+    ]);
+    if (!choice) return;
+    if (choice === "查看偏好组") {
+      await viewGroups(ctx, invokeCli, actions.sessionId);
+      continue;
+    }
+    if (choice === "创建偏好组") {
+      await createGroup(ctx, invokeCli);
+      continue;
+    }
+    if (choice === "编辑组介绍") {
+      await editDescription(ctx, invokeCli);
+      continue;
+    }
+    if (choice === "删除偏好组") {
+      await deleteGroup(ctx, invokeCli);
+      continue;
+    }
+    if (choice === "管理组内规则") {
+      await manageRules(ctx, invokeCli, actions.sessionId);
+      continue;
+    }
+    if (choice === "为当前目录启用组") {
+      await setActivation(ctx, invokeCli, actions.sessionId, "directory", true);
+      continue;
+    }
+    if (choice === "为当前目录禁用组") {
+      await setActivation(ctx, invokeCli, actions.sessionId, "directory", false);
+      continue;
+    }
+    if (choice === "为当前会话启用组") {
+      await setActivation(ctx, invokeCli, actions.sessionId, "session", true);
+      continue;
+    }
+    if (choice === "为当前会话禁用组") {
+      await setActivation(ctx, invokeCli, actions.sessionId, "session", false);
+      continue;
+    }
+    if (choice === "记录反馈") {
+      await actions.feedback();
+      continue;
+    }
+    if (choice === "同步偏好仓库") {
+      const result = await invokeCli(["sync"], undefined, 120_000);
+      if (typeof result.push_error === "string") {
+        ctx.ui.notify(`本地偏好已提交，远端推送失败：${result.push_error}（${text(result.sync_state, "error")}）`, "warning");
+      } else {
+        ctx.ui.notify(`偏好同步完成：${text(result.sync_state, "unknown")}。`, "info");
+      }
+      continue;
+    }
     const confirmed = await ctx.ui.confirm("撤销最近一次变化？", "将通过 Git 新提交恢复最近一次组或规则变化。");
-    if (!confirmed) return;
+    if (!confirmed) continue;
     await invokeCli(["rollback"], undefined, 120_000);
     ctx.ui.notify("最近一次偏好变化已撤销。", "info");
   }

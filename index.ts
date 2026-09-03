@@ -401,11 +401,16 @@ export function preferenceExtension(pi: ExtensionAPI): void {
       } catch {
         effectiveGroups = [];
       }
-      ctx.ui.setStatus("personal-preferences", formatPreferenceSummary(result as PreferenceStatus, effectiveGroups));
-      return result as PreferenceStatus;
+      const status = result as PreferenceStatus;
+      const summary = formatPreferenceSummary(status, effectiveGroups);
+      ctx.ui.setStatus(
+        "personal-preferences",
+        ctx.ui.theme.fg(status.enabled === false || status.model_ready === false ? "warning" : "accent", summary),
+      );
+      return status;
     } catch (error) {
       diagnostic = error instanceof Error ? error.message : String(error);
-      ctx.ui.setStatus("personal-preferences", `preferences: ${diagnostic}`);
+      ctx.ui.setStatus("personal-preferences", ctx.ui.theme.fg("error", "pref error"));
       return undefined;
     }
   }
@@ -482,7 +487,7 @@ export function preferenceExtension(pi: ExtensionAPI): void {
         : layout.captureUserEdits ? "preference collection active" : "file-edit capture disabled by config";
     ctx.ui.setStatus(
       "personal-preferences",
-      collecting ? "preferences: collecting touched-file evidence" : `preferences: ${diagnostic}`,
+      ctx.ui.theme.fg(collecting ? "accent" : "warning", collecting ? "pref collecting" : "pref paused"),
     );
     if (layout) await updateStatus(ctx);
   });
@@ -598,12 +603,17 @@ export function preferenceExtension(pi: ExtensionAPI): void {
     let reason = command.reason;
     if (!sentiment) {
       if (!ctx.hasUI) throw new Error("feedback 在无 UI 模式下需要使用 good 或 fix");
-      const choice = await ctx.ui.select("评价当前结果", ["满意", "需要改进", "取消"]);
-      if (!choice || choice === "取消") return;
-      sentiment = choice === "满意" ? "good" : "fix";
-      if (sentiment === "fix") {
+      for (;;) {
+        const choice = await ctx.ui.select("评价当前结果", ["满意", "需要改进", "返回上一级"]);
+        if (!choice || choice === "返回上一级") return;
+        if (choice === "满意") {
+          sentiment = "good";
+          break;
+        }
         reason = (await ctx.ui.input("需要改进的原因", "请说明原因"))?.trim();
-        if (!reason) throw new Error("需要改进的反馈必须有原因");
+        if (!reason) continue;
+        sentiment = "fix";
+        break;
       }
     }
     if (sentiment === "fix" && !reason?.trim()) throw new Error("feedback fix requires a reason");
@@ -611,15 +621,21 @@ export function preferenceExtension(pi: ExtensionAPI): void {
     const summary = reason?.trim() || "用户对当前结果表示满意";
     const groups = await readGroups();
     const invokeCli = invokeFor(ctx);
-    const group = await resolvePreferenceGroup({
-      explicitGroup: command.group,
-      preferenceText: summary,
-      taskSummary: task?.taskSummary,
-      touchedPaths: task ? [...task.touched.keys()] : [],
-      groups: groupDescriptions(groups),
-      ctx,
-      invokeCli,
-    });
+    let group: string;
+    try {
+      group = await resolvePreferenceGroup({
+        explicitGroup: command.group,
+        preferenceText: summary,
+        taskSummary: task?.taskSummary,
+        touchedPaths: task ? [...task.touched.keys()] : [],
+        groups: groupDescriptions(groups),
+        ctx,
+        invokeCli,
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === "已取消偏好组选择") return;
+      throw error;
+    }
     const signal = sentiment === "good" ? "acceptance" : "rejection";
     const result = await invoke(
       ["capture", "--stdin"],

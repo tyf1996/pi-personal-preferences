@@ -10,6 +10,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import preferenceExtension from "../index.ts";
 import { parsePrefCommand } from "../src/commands.ts";
+import { formatPreferenceSummary } from "../src/dashboard.ts";
 import { resolvePreferenceGroup } from "../src/group.ts";
 
 const CLI = resolve(import.meta.dirname, "../python/wikiskill_preference.py");
@@ -38,6 +39,7 @@ function createHarness(cwd: string, options: HarnessOptions = {}) {
   const notices: Array<{ message: string; level: string }> = [];
   const statuses: Array<string | undefined> = [];
   const uiCalls: Array<{ method: string; title: string; options?: string[] }> = [];
+  const themeColors: string[] = [];
   const selects = [...(options.selects ?? [])];
   const inputs = [...(options.inputs ?? [])];
   const editors = [...(options.editors ?? [])];
@@ -124,6 +126,12 @@ function createHarness(cwd: string, options: HarnessOptions = {}) {
       } : undefined,
     },
     ui: {
+      theme: {
+        fg: (color: string, value: string) => {
+          themeColors.push(color);
+          return value;
+        },
+      },
       notify: (message: string, level: string) => notices.push({ message, level }),
       setStatus: (_key: string, value: string | undefined) => statuses.push(value),
       select: async (title: string, values: string[]) => {
@@ -149,7 +157,10 @@ function createHarness(cwd: string, options: HarnessOptions = {}) {
       reloads += 1;
     },
   } as unknown as ExtensionCommandContext;
-  return { commands, ctx, handlers, notices, statuses, uiCalls, modelCalls, get reloads() { return reloads; } };
+  return {
+    commands, ctx, handlers, notices, statuses, uiCalls, modelCalls, themeColors,
+    get reloads() { return reloads; },
+  };
 }
 
 function init(root: string): void {
@@ -167,6 +178,24 @@ async function configureFake(root: string): Promise<void> {
   };
   await writeFile(path, JSON.stringify(config), "utf8");
 }
+
+test("formats a compact footer status", () => {
+  const summary = formatPreferenceSummary({
+    enabled: true,
+    groups: 12,
+    rules: 34,
+    pending_evidence_count: 2,
+    evolve_due: true,
+    model_ready: true,
+    provider_model: "a-very-long-preference-model-name",
+    provider_thinking_level: "xhigh",
+    sync_state: "no-remote",
+  }, ["communication-preferences", "coding", "documentation"]);
+  assert.ok(summary.length <= 80, summary);
+  assert.match(summary, /^pref communi…\+2 · 12g\/34r/u);
+  assert.match(summary, / · 2e! · local$/u);
+  assert.doesNotMatch(summary, /endpoint|credential|timeout/u);
+});
 
 test("parses only the documented group command shapes", () => {
   assert.deepEqual(parsePrefCommand("remember --group coding Prefer focused changes"), {
@@ -324,7 +353,8 @@ test("default Pi model classifies preferences and inherits or overrides thinking
       thinkingLevel: "high",
     });
     await inherited.handlers.get("session_start")?.({}, inherited.ctx);
-    assert.match(inherited.statuses.at(-1) ?? "", /model ready \(pi test-provider\/test-model, thinking high, timeout 300s\)/u);
+    assert.equal(inherited.statuses.at(-1), "pref global · 2g/0r · test-model:high · local");
+    assert.equal(inherited.themeColors.at(-1), "accent");
     assert.deepEqual(
       JSON.parse(await readFile(configPath, "utf8")).provider,
       { name: "pi", thinking_level: "inherit", timeout_seconds: 300 },
@@ -371,10 +401,10 @@ test("first /pref initializes local data and opens a model-aware dashboard", asy
     assert.deepEqual(groups.groups.map((group: any) => group.name), ["global"]);
     assert.equal((await readFile(join(root, "local/activations.json"), "utf8")).includes("directories"), true);
     assert.match(harness.notices[0]?.message ?? "", /已初始化/u);
-    assert.match(harness.notices[1]?.message ?? "", /model not ready/u);
-    assert.match(harness.notices[1]?.message ?? "", /pi pi\/current/u);
-    assert.match(harness.notices[1]?.message ?? "", /endpoint Pi managed/u);
-    assert.match(harness.notices[1]?.message ?? "", /credential Pi managed/u);
+    assert.match(harness.notices[1]?.message ?? "", /模型：pi pi\/current · 未就绪/u);
+    assert.match(harness.notices[1]?.message ?? "", /同步：no-remote/u);
+    assert.equal(harness.statuses.at(-1), "pref global · 1g/0r · model! · local");
+    assert.equal(harness.themeColors.at(-1), "warning");
     assert.equal(harness.uiCalls[0]?.title, "个人偏好");
   } finally {
     if (previousRoot === undefined) delete process.env.PI_PREFERENCE_DATA_ROOT;
@@ -508,7 +538,7 @@ test("dashboard covers group, rule, activation, feedback, sync, rollback, and he
     });
     assert.match(menuFix.notices.at(-1)?.message ?? "", /需要改进/u);
     const beforeCancel = await readFile(join(root, "local/inbox.jsonl"), "utf8");
-    await runDashboard({ selects: ["记录反馈", "取消"] });
+    await runDashboard({ selects: ["记录反馈", "返回上一级"] });
     assert.equal(await readFile(join(root, "local/inbox.jsonl"), "utf8"), beforeCancel);
 
     const synced = await runDashboard({ selects: ["同步偏好仓库"] });
@@ -533,12 +563,67 @@ test("dashboard covers group, rule, activation, feedback, sync, rollback, and he
 
     const headless = createHarness(root, { hasUI: false });
     await headless.commands.get("pref")?.handler("", headless.ctx);
-    assert.match(headless.notices.at(-1)?.message ?? "", /preferences:/u);
+    assert.match(headless.notices.at(-1)?.message ?? "", /^pref /u);
     assert.equal(headless.uiCalls.length, 0);
     const invalid = createHarness(root);
     await invalid.commands.get("pref")?.handler("remember --group missing rule", invalid.ctx);
     assert.equal(invalid.notices.length, 1);
     assert.equal(invalid.notices[0]?.level, "error");
+  } finally {
+    if (previousRoot === undefined) delete process.env.PI_PREFERENCE_DATA_ROOT;
+    else process.env.PI_PREFERENCE_DATA_ROOT = previousRoot;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("dashboard cancellation returns one menu level at a time", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-personal-preferences-navigation-"));
+  const previousRoot = process.env.PI_PREFERENCE_DATA_ROOT;
+  process.env.PI_PREFERENCE_DATA_ROOT = root;
+  try {
+    init(root);
+    for (const payload of [
+      { action: "create", name: "coding", description: "代码。" },
+      { action: "create", name: "communication", description: "表达。" },
+      { action: "add_rule", group: "coding", rule: "保持改动聚焦。" },
+    ]) {
+      execFileSync("python3", [CLI, "manage-group", "--stdin", "--data-root", root], {
+        input: JSON.stringify(payload),
+        encoding: "utf8",
+      });
+    }
+    const harness = createHarness(root, {
+      selects: [
+        "管理组内规则",
+        "coding",
+        "移动到其他组",
+        "保持改动聚焦。",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        "查看偏好组",
+        undefined,
+        undefined,
+      ],
+    });
+    await harness.commands.get("pref")?.handler("", harness.ctx);
+    assert.deepEqual(
+      harness.uiCalls.filter((call) => call.method === "select").map((call) => call.title),
+      [
+        "个人偏好",
+        "选择要管理的组",
+        "管理组内规则",
+        "选择规则",
+        "移动到其他组",
+        "选择规则",
+        "管理组内规则",
+        "选择要管理的组",
+        "个人偏好",
+        "查看偏好组",
+        "个人偏好",
+      ],
+    );
   } finally {
     if (previousRoot === undefined) delete process.env.PI_PREFERENCE_DATA_ROOT;
     else process.env.PI_PREFERENCE_DATA_ROOT = previousRoot;
@@ -571,7 +656,8 @@ test("auto evolves pending evidence without file collection or a current task", 
     }] });
     const harness = createHarness(root);
     await harness.handlers.get("session_start")?.({}, harness.ctx);
-    assert.match(harness.statuses.at(-1) ?? "", /model ready \(custom fake\/fixture, thinking medium, timeout 60s\).*endpoint ready.*credential PREFERENCE_MODEL_API_KEY ready/u);
+    assert.equal(harness.statuses.at(-1), "pref global · 1g/0r · fixture:med · 1e! · local");
+    assert.equal(harness.themeColors.at(-1), "accent");
     await harness.handlers.get("agent_settled")?.({}, harness.ctx);
     const groups = JSON.parse(await readFile(join(root, "repo/groups.json"), "utf8"));
     assert.deepEqual(groups.groups[0].rules, ["回答保持简洁。"]);

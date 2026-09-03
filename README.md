@@ -11,7 +11,13 @@
 
 ## 安装
 
-推荐安装固定的 GitHub Release：
+推荐跟踪 GitHub `main`，后续可同步最新提交：
+
+```bash
+pi install git:github.com/tyf1996/pi-personal-preferences
+```
+
+如需固定版本，安装指定 Release tag：
 
 ```bash
 pi install git:github.com/tyf1996/pi-personal-preferences@v0.2.0
@@ -52,10 +58,10 @@ python/wikiskill_preference_core/
 pi list
 ```
 
-升级到新的固定版本：
+同步无版本 Git 安装源的最新提交：
 
 ```bash
-pi install git:github.com/tyf1996/pi-personal-preferences@v0.3.0
+pi update --extension git:github.com/tyf1996/pi-personal-preferences
 ```
 
 移除扩展：
@@ -64,7 +70,7 @@ pi install git:github.com/tyf1996/pi-personal-preferences@v0.3.0
 pi remove git:github.com/tyf1996/pi-personal-preferences
 ```
 
-固定 tag 不会被 `pi update --extensions` 自动移动；升级时显式安装新的 tag。
+无版本 Git 安装源跟踪默认分支，可由 Pi 的 package update 检查和 `pi update --extensions` 更新；固定 tag 不会自动移动。
 
 ## 首次运行
 
@@ -174,7 +180,13 @@ git clone git@github.com:YOUR_GITHUB_USER/YOUR_PRIVATE_REPO.git "$PREF_ROOT/repo
 /pref feedback --group <组名> fix <原因>
 ```
 
-`/pref` 面板可以管理组、组介绍、规则、目录启用、会话启用、同步和 rollback。
+`/pref` 面板可以管理组、组介绍、规则、目录启用、会话启用、同步和 rollback。子菜单中按 Esc 或 Ctrl+C 返回直接上一级；在顶层菜单按 Esc 或 Ctrl+C 退出面板。
+
+底部状态使用主题色和紧凑格式，例如：
+
+```text
+pref global · 1g/2r · gpt-5.6-sol:xh · local
+```
 
 ## 同步边界
 
