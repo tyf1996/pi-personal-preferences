@@ -100,40 +100,34 @@ function shorten(value: string, limit: number): string {
 }
 
 function compactGroups(groups: string[]): string {
-  if (!groups.length) return "none";
-  const first = shorten(groups[0] ?? "none", 8);
-  return groups.length > 1 ? `${first}+${groups.length - 1}` : first;
-}
-
-function compactThinking(value: unknown): string {
-  const levels: Record<string, string> = {
-    off: "off",
-    minimal: "min",
-    low: "low",
-    medium: "med",
-    high: "high",
-    xhigh: "xh",
-    max: "max",
-  };
-  return levels[text(value, "off")] ?? "off";
+  if (!groups.length) return "无启用组";
+  const first = shorten(groups[0] ?? "无启用组", 12);
+  return groups.length > 1 ? `${first} +${groups.length - 1}` : first;
 }
 
 function compactSync(value: unknown): string {
+  const labels: Record<string, string> = {
+    "no-remote": "本地",
+    clean: "已同步",
+    ahead: "待推送",
+    behind: "待拉取",
+    diverged: "已分叉",
+    error: "同步异常",
+  };
   const state = text(value, "error");
-  if (state === "no-remote") return "local";
-  if (state === "clean") return "synced";
-  return shorten(state, 10);
+  return labels[state] ?? shorten(state, 12);
 }
 
 export function formatPreferenceSummary(status: PreferenceStatus, effectiveGroups: string[] = []): string {
-  const groups = status.enabled === false ? "off" : compactGroups(effectiveGroups);
-  const counts = `${number(status.groups)}g/${number(status.rules)}r`;
-  const model = status.model_ready === true
-    ? `${shorten(text(status.provider_model, "model"), 16)}:${compactThinking(status.provider_thinking_level)}`
-    : "model!";
+  const parts = [
+    status.enabled === false ? "偏好：已停用" : `偏好：${compactGroups(effectiveGroups)}`,
+    `${number(status.groups)}组/${number(status.rules)}规则`,
+  ];
   const pending = number(status.pending_evidence_count);
-  const evidence = pending > 0 ? ` · ${pending}e${status.evolve_due === true ? "!" : ""}` : "";
-  return `pref ${groups} · ${counts} · ${model}${evidence} · ${compactSync(status.sync_state)}`;
+  if (pending > 0) parts.push(`${pending}条待处理${status.evolve_due === true ? "!" : ""}`);
+  if (status.model_ready === false) parts.push("模型未就绪");
+  parts.push(compactSync(status.sync_state));
+  return parts.join(" · ");
 }
 
 function formatPreferenceDetails(status: PreferenceStatus): string {
@@ -345,10 +339,7 @@ export async function showPreferenceDashboard(
       ctx.ui.notify(summary, "info");
       return;
     }
-    ctx.ui.setStatus(
-      "personal-preferences",
-      ctx.ui.theme.fg(status.enabled === false || status.model_ready === false ? "warning" : "accent", summary),
-    );
+    ctx.ui.setStatus("personal-preferences", summary);
     if (!introShown) {
       ctx.ui.notify([
         "个人偏好",

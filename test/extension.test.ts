@@ -11,6 +11,7 @@ import type {
 import preferenceExtension from "../index.ts";
 import { parsePrefCommand } from "../src/commands.ts";
 import { formatPreferenceSummary } from "../src/dashboard.ts";
+import { renderPreferenceFooter } from "../src/footer.ts";
 import { resolvePreferenceGroup } from "../src/group.ts";
 
 const CLI = resolve(import.meta.dirname, "../python/wikiskill_preference.py");
@@ -40,6 +41,8 @@ function createHarness(cwd: string, options: HarnessOptions = {}) {
   const statuses: Array<string | undefined> = [];
   const uiCalls: Array<{ method: string; title: string; options?: string[] }> = [];
   const themeColors: string[] = [];
+  const extensionStatuses = new Map<string, string>();
+  let footerFactory: any;
   const selects = [...(options.selects ?? [])];
   const inputs = [...(options.inputs ?? [])];
   const editors = [...(options.editors ?? [])];
@@ -66,6 +69,12 @@ function createHarness(cwd: string, options: HarnessOptions = {}) {
     maxTokens: 8_192,
   } : undefined;
   let reloads = 0;
+  const theme = {
+    fg: (color: string, value: string) => {
+      themeColors.push(color);
+      return value;
+    },
+  };
   const pi = {
     on(name: string, handler: Handler) {
       handlers.set(name, handler);
@@ -79,7 +88,11 @@ function createHarness(cwd: string, options: HarnessOptions = {}) {
     cwd,
     hasUI: options.hasUI ?? true,
     mode: "tui",
-    sessionManager: { getSessionId: () => "session-test" },
+    sessionManager: {
+      getSessionId: () => "session-test",
+      getEntries: () => [],
+      getSessionName: () => undefined,
+    },
     model,
     thinkingLevel: options.thinkingLevel ?? "off",
     modelRegistry: {
@@ -125,15 +138,16 @@ function createHarness(cwd: string, options: HarnessOptions = {}) {
         },
       } : undefined,
     },
+    getContextUsage: () => ({ tokens: 100, contextWindow: 128_000, percent: 0.1 }),
     ui: {
-      theme: {
-        fg: (color: string, value: string) => {
-          themeColors.push(color);
-          return value;
-        },
-      },
+      theme,
       notify: (message: string, level: string) => notices.push({ message, level }),
-      setStatus: (_key: string, value: string | undefined) => statuses.push(value),
+      setStatus: (key: string, value: string | undefined) => {
+        statuses.push(value);
+        if (value === undefined) extensionStatuses.delete(key);
+        else extensionStatuses.set(key, value);
+      },
+      setFooter: (factory: unknown) => { footerFactory = factory; },
       select: async (title: string, values: string[]) => {
         uiCalls.push({ method: "select", title, options: [...values] });
         return selects.shift();
@@ -159,6 +173,19 @@ function createHarness(cwd: string, options: HarnessOptions = {}) {
   } as unknown as ExtensionCommandContext;
   return {
     commands, ctx, handlers, notices, statuses, uiCalls, modelCalls, themeColors,
+    renderFooter(width = 100) {
+      if (!footerFactory) return [] as string[];
+      const footer = footerFactory(
+        { requestRender() {} },
+        theme,
+        {
+          getGitBranch: () => "main",
+          getExtensionStatuses: () => extensionStatuses,
+          onBranchChange: () => () => undefined,
+        },
+      );
+      return footer.render(width) as string[];
+    },
     get reloads() { return reloads; },
   };
 }
@@ -179,7 +206,7 @@ async function configureFake(root: string): Promise<void> {
   await writeFile(path, JSON.stringify(config), "utf8");
 }
 
-test("formats a compact footer status", () => {
+test("formats a readable right-aligned footer status", () => {
   const summary = formatPreferenceSummary({
     enabled: true,
     groups: 12,
@@ -187,14 +214,23 @@ test("formats a compact footer status", () => {
     pending_evidence_count: 2,
     evolve_due: true,
     model_ready: true,
-    provider_model: "a-very-long-preference-model-name",
-    provider_thinking_level: "xhigh",
     sync_state: "no-remote",
   }, ["communication-preferences", "coding", "documentation"]);
-  assert.ok(summary.length <= 80, summary);
-  assert.match(summary, /^pref communi…\+2 · 12g\/34r/u);
-  assert.match(summary, / · 2e! · local$/u);
-  assert.doesNotMatch(summary, /endpoint|credential|timeout/u);
+  assert.equal(summary, "偏好：communicati… +2 · 12组/34规则 · 2条待处理! · 本地");
+  const lines = renderPreferenceFooter({
+    cwd: "/workspace/project",
+    branch: "feature",
+    preferenceStatus: summary,
+    contextPercent: 12.5,
+    contextWindow: 128_000,
+    model: "gpt-5.6-sol",
+    thinkingLevel: "xhigh",
+  }, 120);
+  assert.equal(lines.length, 2);
+  assert.match(lines[0] ?? "", /^\/workspace\/project \(feature\)/u);
+  assert.ok(lines[0]?.endsWith(summary));
+  assert.match(lines[1] ?? "", /^12\.5%\/128k/u);
+  assert.ok(lines[1]?.endsWith("gpt-5.6-sol • xhigh"));
 });
 
 test("parses only the documented group command shapes", () => {
@@ -353,8 +389,9 @@ test("default Pi model classifies preferences and inherits or overrides thinking
       thinkingLevel: "high",
     });
     await inherited.handlers.get("session_start")?.({}, inherited.ctx);
-    assert.equal(inherited.statuses.at(-1), "pref global · 2g/0r · test-model:high · local");
-    assert.equal(inherited.themeColors.at(-1), "accent");
+    assert.equal(inherited.statuses.at(-1), "偏好：global · 2组/0规则 · 本地");
+    assert.ok(inherited.renderFooter(200)[0]?.endsWith("偏好：global · 2组/0规则 · 本地"));
+    assert.equal(inherited.themeColors.at(-1), "dim");
     assert.deepEqual(
       JSON.parse(await readFile(configPath, "utf8")).provider,
       { name: "pi", thinking_level: "inherit", timeout_seconds: 300 },
@@ -403,8 +440,7 @@ test("first /pref initializes local data and opens a model-aware dashboard", asy
     assert.match(harness.notices[0]?.message ?? "", /已初始化/u);
     assert.match(harness.notices[1]?.message ?? "", /模型：pi pi\/current · 未就绪/u);
     assert.match(harness.notices[1]?.message ?? "", /同步：no-remote/u);
-    assert.equal(harness.statuses.at(-1), "pref global · 1g/0r · model! · local");
-    assert.equal(harness.themeColors.at(-1), "warning");
+    assert.equal(harness.statuses.at(-1), "偏好：global · 1组/0规则 · 模型未就绪 · 本地");
     assert.equal(harness.uiCalls[0]?.title, "个人偏好");
   } finally {
     if (previousRoot === undefined) delete process.env.PI_PREFERENCE_DATA_ROOT;
@@ -563,7 +599,7 @@ test("dashboard covers group, rule, activation, feedback, sync, rollback, and he
 
     const headless = createHarness(root, { hasUI: false });
     await headless.commands.get("pref")?.handler("", headless.ctx);
-    assert.match(headless.notices.at(-1)?.message ?? "", /^pref /u);
+    assert.match(headless.notices.at(-1)?.message ?? "", /^偏好：/u);
     assert.equal(headless.uiCalls.length, 0);
     const invalid = createHarness(root);
     await invalid.commands.get("pref")?.handler("remember --group missing rule", invalid.ctx);
@@ -656,8 +692,9 @@ test("auto evolves pending evidence without file collection or a current task", 
     }] });
     const harness = createHarness(root);
     await harness.handlers.get("session_start")?.({}, harness.ctx);
-    assert.equal(harness.statuses.at(-1), "pref global · 1g/0r · fixture:med · 1e! · local");
-    assert.equal(harness.themeColors.at(-1), "accent");
+    assert.equal(harness.statuses.at(-1), "偏好：global · 1组/0规则 · 1条待处理! · 本地");
+    assert.ok(harness.renderFooter(200)[0]?.endsWith("偏好：global · 1组/0规则 · 1条待处理! · 本地"));
+    assert.equal(harness.themeColors.at(-1), "dim");
     await harness.handlers.get("agent_settled")?.({}, harness.ctx);
     const groups = JSON.parse(await readFile(join(root, "repo/groups.json"), "utf8"));
     assert.deepEqual(groups.groups[0].rules, ["回答保持简洁。"]);

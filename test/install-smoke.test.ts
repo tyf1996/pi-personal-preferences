@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -98,6 +98,8 @@ test("packed package installs and initializes without monorepo paths or CLI over
     const packageDirectory = join(extracted, "package");
     const cli = join(packageDirectory, "python/wikiskill_preference.py");
     assert.equal(existsSync(cli), true);
+    const manifest = JSON.parse(await readFile(join(packageDirectory, "package.json"), "utf8"));
+    assert.equal(manifest.peerDependencies?.["@earendil-works/pi-tui"], "*");
     assert.equal(existsSync(join(extracted, "skills")), false);
     const directData = join(root, "direct-data");
     execFileSync("python3", [cli, "init", "--data-root", directData], { encoding: "utf8" });
@@ -120,6 +122,13 @@ test("packed package installs and initializes without monorepo paths or CLI over
         input: JSON.stringify(payload),
         encoding: "utf8",
       });
+    }
+
+    const peerScope = join(packageDirectory, "node_modules/@earendil-works");
+    await mkdir(peerScope, { recursive: true });
+    const peerTarget = join(peerScope, "pi-tui");
+    if (!existsSync(peerTarget)) {
+      await symlink(resolve(PACKAGE_ROOT, "node_modules/@earendil-works/pi-tui"), peerTarget, "dir");
     }
 
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;

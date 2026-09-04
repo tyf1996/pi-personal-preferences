@@ -29,6 +29,7 @@ import {
   type PreferenceGroup,
   type PreferenceStatus,
 } from "./src/dashboard.ts";
+import { installPreferenceFooter } from "./src/footer.ts";
 import {
   completeWithPiModel,
   piModelEnvironment,
@@ -403,14 +404,11 @@ export function preferenceExtension(pi: ExtensionAPI): void {
       }
       const status = result as PreferenceStatus;
       const summary = formatPreferenceSummary(status, effectiveGroups);
-      ctx.ui.setStatus(
-        "personal-preferences",
-        ctx.ui.theme.fg(status.enabled === false || status.model_ready === false ? "warning" : "accent", summary),
-      );
+      ctx.ui.setStatus("personal-preferences", summary);
       return status;
     } catch (error) {
       diagnostic = error instanceof Error ? error.message : String(error);
-      ctx.ui.setStatus("personal-preferences", ctx.ui.theme.fg("error", "pref error"));
+      ctx.ui.setStatus("personal-preferences", "偏好：状态异常");
       return undefined;
     }
   }
@@ -473,6 +471,7 @@ export function preferenceExtension(pi: ExtensionAPI): void {
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    installPreferenceFooter(ctx);
     task = undefined;
     evolving = false;
     autoEvolveBlocked = false;
@@ -487,7 +486,7 @@ export function preferenceExtension(pi: ExtensionAPI): void {
         : layout.captureUserEdits ? "preference collection active" : "file-edit capture disabled by config";
     ctx.ui.setStatus(
       "personal-preferences",
-      ctx.ui.theme.fg(collecting ? "accent" : "warning", collecting ? "pref collecting" : "pref paused"),
+      collecting ? "偏好：采集中" : "偏好：已暂停",
     );
     if (layout) await updateStatus(ctx);
   });

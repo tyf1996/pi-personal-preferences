@@ -182,11 +182,13 @@ git clone git@github.com:YOUR_GITHUB_USER/YOUR_PRIVATE_REPO.git "$PREF_ROOT/repo
 
 `/pref` 面板可以管理组、组介绍、规则、目录启用、会话启用、同步和 rollback。子菜单中按 Esc 或 Ctrl+C 返回直接上一级；在顶层菜单按 Esc 或 Ctrl+C 退出面板。
 
-底部状态使用主题色和紧凑格式，例如：
+偏好状态使用与 footer 其他信息一致的灰色，并显示在第一行右侧；左侧目录、Git 分支和会话名优先保留。状态使用可读的紧凑格式，例如：
 
 ```text
-pref global · 1g/2r · gpt-5.6-sol:xh · local
+~/project (main)                         偏好：global · 1组/2规则 · 本地
 ```
+
+footer 第二行继续显示 token、context、模型和 thinking；其他扩展状态继续显示在后续行。
 
 ## 同步边界
 
