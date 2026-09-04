@@ -215,8 +215,11 @@ test("formats a readable right-aligned footer status", () => {
     evolve_due: true,
     model_ready: true,
     sync_state: "no-remote",
-  }, ["communication-preferences", "coding", "documentation"]);
-  assert.equal(summary, "偏好：communicati… +2 · 12组/34规则 · 2条待处理! · 本地");
+  }, ["global", "communication-preferences", "coding", "documentation"]);
+  assert.equal(
+    summary,
+    "启用：communication-preferences、coding、documentation、global · 共12组/34规则 · 2条待处理! · 本地",
+  );
   const lines = renderPreferenceFooter({
     cwd: "/workspace/project",
     branch: "feature",
@@ -225,7 +228,7 @@ test("formats a readable right-aligned footer status", () => {
     contextWindow: 128_000,
     model: "gpt-5.6-sol",
     thinkingLevel: "xhigh",
-  }, 120);
+  }, 180);
   assert.equal(lines.length, 2);
   assert.match(lines[0] ?? "", /^\/workspace\/project \(feature\)/u);
   assert.ok(lines[0]?.endsWith(summary));
@@ -389,8 +392,8 @@ test("default Pi model classifies preferences and inherits or overrides thinking
       thinkingLevel: "high",
     });
     await inherited.handlers.get("session_start")?.({}, inherited.ctx);
-    assert.equal(inherited.statuses.at(-1), "偏好：global · 2组/0规则 · 本地");
-    assert.ok(inherited.renderFooter(200)[0]?.endsWith("偏好：global · 2组/0规则 · 本地"));
+    assert.equal(inherited.statuses.at(-1), "启用：global · 共2组/0规则 · 本地");
+    assert.ok(inherited.renderFooter(200)[0]?.endsWith("启用：global · 共2组/0规则 · 本地"));
     assert.equal(inherited.themeColors.at(-1), "dim");
     assert.deepEqual(
       JSON.parse(await readFile(configPath, "utf8")).provider,
@@ -440,7 +443,7 @@ test("first /pref initializes local data and opens a model-aware dashboard", asy
     assert.match(harness.notices[0]?.message ?? "", /已初始化/u);
     assert.match(harness.notices[1]?.message ?? "", /模型：pi pi\/current · 未就绪/u);
     assert.match(harness.notices[1]?.message ?? "", /同步：no-remote/u);
-    assert.equal(harness.statuses.at(-1), "偏好：global · 1组/0规则 · 模型未就绪 · 本地");
+    assert.equal(harness.statuses.at(-1), "启用：global · 共1组/0规则 · 模型未就绪 · 本地");
     assert.equal(harness.uiCalls[0]?.title, "个人偏好");
   } finally {
     if (previousRoot === undefined) delete process.env.PI_PREFERENCE_DATA_ROOT;
@@ -599,7 +602,7 @@ test("dashboard covers group, rule, activation, feedback, sync, rollback, and he
 
     const headless = createHarness(root, { hasUI: false });
     await headless.commands.get("pref")?.handler("", headless.ctx);
-    assert.match(headless.notices.at(-1)?.message ?? "", /^偏好：/u);
+    assert.match(headless.notices.at(-1)?.message ?? "", /^启用：/u);
     assert.equal(headless.uiCalls.length, 0);
     const invalid = createHarness(root);
     await invalid.commands.get("pref")?.handler("remember --group missing rule", invalid.ctx);
@@ -692,8 +695,8 @@ test("auto evolves pending evidence without file collection or a current task", 
     }] });
     const harness = createHarness(root);
     await harness.handlers.get("session_start")?.({}, harness.ctx);
-    assert.equal(harness.statuses.at(-1), "偏好：global · 1组/0规则 · 1条待处理! · 本地");
-    assert.ok(harness.renderFooter(200)[0]?.endsWith("偏好：global · 1组/0规则 · 1条待处理! · 本地"));
+    assert.equal(harness.statuses.at(-1), "启用：global · 共1组/0规则 · 1条待处理! · 本地");
+    assert.ok(harness.renderFooter(200)[0]?.endsWith("启用：global · 共1组/0规则 · 1条待处理! · 本地"));
     assert.equal(harness.themeColors.at(-1), "dim");
     await harness.handlers.get("agent_settled")?.({}, harness.ctx);
     const groups = JSON.parse(await readFile(join(root, "repo/groups.json"), "utf8"));

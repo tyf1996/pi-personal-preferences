@@ -185,7 +185,7 @@ git clone git@github.com:YOUR_GITHUB_USER/YOUR_PRIVATE_REPO.git "$PREF_ROOT/repo
 偏好状态使用与 footer 其他信息一致的灰色，并显示在第一行右侧；左侧目录、Git 分支和会话名优先保留。状态使用可读的紧凑格式，例如：
 
 ```text
-~/project (main)                         偏好：global · 1组/2规则 · 本地
+~/project (main)             启用：coding、communication、global · 共3组/5规则 · 本地
 ```
 
 footer 第二行继续显示 token、context、模型和 thinking；其他扩展状态继续显示在后续行。

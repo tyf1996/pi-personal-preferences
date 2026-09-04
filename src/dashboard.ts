@@ -100,9 +100,12 @@ function shorten(value: string, limit: number): string {
 }
 
 function compactGroups(groups: string[]): string {
-  if (!groups.length) return "无启用组";
-  const first = shorten(groups[0] ?? "无启用组", 12);
-  return groups.length > 1 ? `${first} +${groups.length - 1}` : first;
+  if (!groups.length) return "无";
+  const ordered = [
+    ...groups.filter((group) => group !== "global"),
+    ...groups.filter((group) => group === "global"),
+  ];
+  return ordered.join("、");
 }
 
 function compactSync(value: unknown): string {
@@ -120,8 +123,8 @@ function compactSync(value: unknown): string {
 
 export function formatPreferenceSummary(status: PreferenceStatus, effectiveGroups: string[] = []): string {
   const parts = [
-    status.enabled === false ? "偏好：已停用" : `偏好：${compactGroups(effectiveGroups)}`,
-    `${number(status.groups)}组/${number(status.rules)}规则`,
+    status.enabled === false ? "偏好已停用" : `启用：${compactGroups(effectiveGroups)}`,
+    `共${number(status.groups)}组/${number(status.rules)}规则`,
   ];
   const pending = number(status.pending_evidence_count);
   if (pending > 0) parts.push(`${pending}条待处理${status.evolve_due === true ? "!" : ""}`);
