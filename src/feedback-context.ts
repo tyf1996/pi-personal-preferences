@@ -50,23 +50,44 @@ function messageRole(entry: Entry): string | undefined {
     ? (message as { role: string }).role : undefined;
 }
 
+function assistantStopReason(entry: Entry): unknown {
+  if (messageRole(entry) !== "assistant") return undefined;
+  return (entry.message as { stopReason?: unknown } | undefined)?.stopReason;
+}
+
+function assistantEndsTask(entry: Entry): boolean {
+  return ["stop", "length", "error", "aborted"].includes(String(assistantStopReason(entry)));
+}
+
+function assistantTerminal(entry: Entry): boolean {
+  return assistantStopReason(entry) === "stop";
+}
+
 function assistantCompleted(entry: Entry): boolean {
-  if (messageRole(entry) !== "assistant") return false;
-  const message = entry.message as { stopReason?: unknown } | undefined;
-  return message?.stopReason !== "aborted" && message?.stopReason !== "error" && Boolean(visibleText(entry.message));
+  return assistantTerminal(entry) && Boolean(visibleText(entry.message));
+}
+
+function sourceKey(userEntryId: string, assistantEntryId: string): string {
+  return `feedback-task-${createHash("sha256").update(`${userEntryId}:${assistantEntryId}`).digest("hex").slice(0, 24)}`;
+}
+
+function sourcePair(userEntryId: string, assistantEntryId: string): string {
+  return `${userEntryId}:${assistantEntryId}`;
 }
 
 function validMarker(value: unknown): { task_key: string; user_entry_id: string; assistant_entry_id: string } | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const data = value as Record<string, unknown>;
-  if (data.schema_version !== 2 || typeof data.task_key !== "string" || typeof data.user_entry_id !== "string" || typeof data.assistant_entry_id !== "string") return undefined;
+  if (data.schema_version !== 2 || typeof data.task_key !== "string" || !/^feedback-task-[0-9a-f]{24}$/u.test(data.task_key)
+      || typeof data.user_entry_id !== "string" || !data.user_entry_id
+      || typeof data.assistant_entry_id !== "string" || !data.assistant_entry_id) return undefined;
   return { task_key: data.task_key, user_entry_id: data.user_entry_id, assistant_entry_id: data.assistant_entry_id };
 }
 
 /**
- * Uses only SessionManager's active branch and entry APIs. Markers retain IDs,
- * never message bodies, so reload/fork/compaction cannot silently substitute a
- * synthetic prompt or transcript-derived target.
+ * Uses only SessionManager's active branch APIs. Real user/final-assistant
+ * messages are the source; body-free markers only preserve identity and dedupe.
+ * Summaries and unrelated branches cannot substitute source text.
  */
 export class FeedbackContext {
   private targets = new Map<string, FeedbackTarget>();
@@ -78,76 +99,128 @@ export class FeedbackContext {
     return manager.getBranch(leaf ?? undefined) as Entry[];
   }
 
-  private targetFromMarker(ctx: ExtensionContext, marker: { task_key: string; user_entry_id: string; assistant_entry_id: string }): FeedbackTarget | undefined {
-    const manager = ctx.sessionManager as unknown as { getEntry?: (id: string) => unknown };
-    if (typeof manager.getEntry !== "function") return undefined;
+  private targetsFromBranch(ctx: ExtensionContext): FeedbackTarget[] {
     const branch = this.branch(ctx);
-    const branchIds = new Set(branch.map((entry) => typeof entry.id === "string" ? entry.id : undefined).filter((id): id is string => Boolean(id)));
-    if (!branchIds.has(marker.user_entry_id) || !branchIds.has(marker.assistant_entry_id)) return undefined;
-    const user = manager.getEntry(marker.user_entry_id) as Entry | undefined;
-    const assistant = manager.getEntry(marker.assistant_entry_id) as Entry | undefined;
-    if (!user || !assistant || messageRole(user) !== "user" || !assistantCompleted(assistant)) return undefined;
-    const userIndex = branch.findIndex((entry) => entry.id === marker.user_entry_id);
-    const assistantIndex = branch.findIndex((entry) => entry.id === marker.assistant_entry_id);
-    if (userIndex < 0 || assistantIndex <= userIndex) return undefined;
-    const userText = branch.slice(userIndex, assistantIndex)
-      .filter((entry) => messageRole(entry) === "user")
-      .map((entry) => visibleText(entry.message))
-      .filter((text): text is string => Boolean(text))
-      .join("\n");
-    const assistantText = visibleText(assistant.message);
-    if (!userText || !assistantText) return undefined;
-    return { taskKey: marker.task_key, userEntryId: marker.user_entry_id, assistantEntryId: marker.assistant_entry_id, userText, assistantText };
+    const parsed: FeedbackTarget[] = [];
+    let taskStart = 0;
+
+    for (let assistantIndex = 0; assistantIndex < branch.length; assistantIndex += 1) {
+      const assistant = branch[assistantIndex];
+      if (!assistantEndsTask(assistant)) continue;
+      let userIndex = -1;
+      for (let index = taskStart; index < assistantIndex; index += 1) {
+        const entry = branch[index];
+        if (messageRole(entry) === "user" && typeof entry.id === "string" && visibleText(entry.message)) {
+          userIndex = index;
+          break;
+        }
+      }
+      const user = branch[userIndex];
+      if (user && typeof user.id === "string" && typeof assistant.id === "string" && assistantCompleted(assistant)) {
+        const userText = branch.slice(userIndex, assistantIndex)
+          .filter((entry) => messageRole(entry) === "user")
+          .map((entry) => visibleText(entry.message))
+          .filter((text): text is string => Boolean(text))
+          .join("\n");
+        const assistantText = visibleText(assistant.message);
+        if (userText && assistantText) {
+          parsed.push({
+            taskKey: sourceKey(user.id, assistant.id),
+            userEntryId: user.id,
+            assistantEntryId: assistant.id,
+            userText,
+            assistantText,
+          });
+        }
+      }
+      taskStart = assistantIndex + 1;
+    }
+
+    const parsedPairs = new Set(parsed.map((target) => sourcePair(target.userEntryId, target.assistantEntryId)));
+    const markerKeys = new Map<string, string>();
+    for (const entry of branch) {
+      if (entry.type !== "custom" || entry.customType !== "personal-preferences-feedback-target") continue;
+      const marker = validMarker(entry.data);
+      if (!marker) continue;
+      const pair = sourcePair(marker.user_entry_id, marker.assistant_entry_id);
+      if (parsedPairs.has(pair) && !markerKeys.has(pair)) {
+        markerKeys.set(pair, marker.task_key);
+      }
+    }
+
+    const manager = ctx.sessionManager as unknown as { getChildren?: (parentId: string) => unknown[] };
+    if (typeof manager.getChildren === "function") {
+      const traversableMetadata = new Set(["custom", "label", "session_info", "model_change", "thinking_level_change"]);
+      for (const target of parsed) {
+        const pair = sourcePair(target.userEntryId, target.assistantEntryId);
+        if (markerKeys.has(pair)) continue;
+        const pending = [...manager.getChildren(target.assistantEntryId)] as Entry[];
+        const visited = new Set<string>();
+        while (pending.length && visited.size < 64) {
+          const entry = pending.shift()!;
+          if (typeof entry.id !== "string" || visited.has(entry.id)) continue;
+          visited.add(entry.id);
+          if (entry.type === "custom" && entry.customType === "personal-preferences-feedback-target") {
+            const marker = validMarker(entry.data);
+            if (marker && sourcePair(marker.user_entry_id, marker.assistant_entry_id) === pair) {
+              markerKeys.set(pair, marker.task_key);
+              break;
+            }
+          }
+          if (!traversableMetadata.has(String(entry.type))) continue;
+          pending.push(...manager.getChildren(entry.id) as Entry[]);
+        }
+      }
+    }
+
+    const cachedKeys = new Map<string, string>();
+    for (const target of this.targets.values()) {
+      cachedKeys.set(sourcePair(target.userEntryId, target.assistantEntryId), target.taskKey);
+    }
+    const usedKeys = new Set<string>();
+    return parsed.map((target) => {
+      const pair = sourcePair(target.userEntryId, target.assistantEntryId);
+      const preferredKey = markerKeys.get(pair) ?? cachedKeys.get(pair) ?? target.taskKey;
+      const taskKey = usedKeys.has(preferredKey) ? target.taskKey : preferredKey;
+      usedKeys.add(taskKey);
+      return { ...target, taskKey };
+    });
   }
 
   restore(ctx: ExtensionContext): FeedbackTarget[] {
     this.targets.clear();
-    for (const entry of this.branch(ctx)) {
-      if (entry.type !== "custom" || entry.customType !== "personal-preferences-feedback-target") continue;
-      const marker = validMarker(entry.data);
-      if (!marker) continue;
-      const target = this.targetFromMarker(ctx, marker);
-      if (target) this.targets.set(target.taskKey, target);
-    }
     return this.available(ctx);
   }
 
   markSettled(ctx: ExtensionContext, appendMarker: (data: Record<string, unknown>) => void): FeedbackTarget | undefined {
     const branch = this.branch(ctx);
-    let assistant: Entry | undefined;
-    let assistantIndex = -1;
-    for (let index = branch.length - 1; index >= 0; index -= 1) {
-      const entry = branch[index];
-      if (assistantCompleted(entry)) { assistant = entry; assistantIndex = index; break; }
-    }
-    let previousAssistantIndex = -1;
-    for (let index = assistantIndex - 1; index >= 0; index -= 1) {
-      if (assistantCompleted(branch[index])) { previousAssistantIndex = index; break; }
-    }
-    const userCandidates = branch.slice(previousAssistantIndex + 1, assistantIndex)
-      .filter((entry) => messageRole(entry) === "user" && visibleText(entry.message));
-    const user = userCandidates[0];
-    if (!user || !assistant || typeof user.id !== "string" || typeof assistant.id !== "string") return undefined;
-    const taskKey = `feedback-task-${createHash("sha256").update(`${ctx.sessionManager.getSessionId()}:${user.id}:${assistant.id}`).digest("hex").slice(0, 24)}`;
-    const marker = { schema_version: 2, task_key: taskKey, user_entry_id: user.id, assistant_entry_id: assistant.id };
-    const target = this.targetFromMarker(ctx, marker);
+    const target = this.targetsFromBranch(ctx).at(-1);
     if (!target) return undefined;
-    this.targets.set(taskKey, target);
-    const alreadyMarked = branch.some((entry) => entry.type === "custom" && entry.customType === "personal-preferences-feedback-target" && validMarker(entry.data)?.task_key === taskKey);
+    this.targets.set(target.taskKey, target);
+    const alreadyMarked = branch.some((entry) => {
+      if (entry.type !== "custom" || entry.customType !== "personal-preferences-feedback-target") return false;
+      const marker = validMarker(entry.data);
+      return marker?.task_key === target.taskKey
+        && marker.user_entry_id === target.userEntryId
+        && marker.assistant_entry_id === target.assistantEntryId;
+    });
     if (alreadyMarked) return target;
     // Marker contains only immutable entry references. No user/assistant body
     // is persisted here; data is re-projected from the active branch on reload.
-    appendMarker(marker);
+    appendMarker({
+      schema_version: 2,
+      task_key: target.taskKey,
+      user_entry_id: target.userEntryId,
+      assistant_entry_id: target.assistantEntryId,
+    });
     return target;
   }
 
   available(ctx: ExtensionContext): FeedbackTarget[] {
-    for (const [taskKey, cached] of this.targets) {
-      const live = this.targetFromMarker(ctx, { task_key: taskKey, user_entry_id: cached.userEntryId, assistant_entry_id: cached.assistantEntryId });
-      if (live) this.targets.set(taskKey, live);
-      else this.targets.delete(taskKey);
-    }
-    return [...this.targets.values()];
+    const live = this.targetsFromBranch(ctx);
+    this.targets.clear();
+    for (const target of live) this.targets.set(target.taskKey, target);
+    return live;
   }
 
   snapshot(ctx: ExtensionContext, taskKey: string, storageMode: "local_only" | "ask"): FeedbackSnapshot | undefined {

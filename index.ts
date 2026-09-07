@@ -476,6 +476,10 @@ export function preferenceExtension(pi: ExtensionAPI): void {
   const feedbackBackground = new FeedbackBackground({
     onEvidence: triggerProposalForEvidence,
   });
+  const appendFeedbackMarker = (data: Record<string, unknown>): void => {
+    const append = (pi as unknown as { appendEntry?: (customType: string, data: unknown) => void }).appendEntry;
+    if (typeof append === "function") append("personal-preferences-feedback-target", data);
+  };
   let diagnostic = "preference data is not initialized";
   let taskCounter = 0;
   let task: TaskState | undefined;
@@ -569,6 +573,7 @@ export function preferenceExtension(pi: ExtensionAPI): void {
     feedbackBackground.setForegroundBusy(false);
     proposalBackground.setForegroundBusy(false);
     feedbackContext.restore(ctx);
+    feedbackContext.markSettled(ctx, appendFeedbackMarker);
     if (configPresence() === "missing") {
       collecting = false;
       diagnostic = "preference data is not initialized";
@@ -651,10 +656,7 @@ export function preferenceExtension(pi: ExtensionAPI): void {
     if (collecting && task && task.touched.size) task.settled = true;
     feedbackBackground.setForegroundBusy(false);
     proposalBackground.setForegroundBusy(false);
-    feedbackContext.markSettled(ctx, (data) => {
-      const append = (pi as unknown as { appendEntry?: (customType: string, data: unknown) => void }).appendEntry;
-      if (typeof append === "function") append("personal-preferences-feedback-target", data);
-    });
+    feedbackContext.markSettled(ctx, appendFeedbackMarker);
     let layout: RepoLayout | undefined;
     try { if (configPresence() === "ready") layout = await loadLayout(); } catch (error) { diagnostic = error instanceof Error ? error.message : String(error); }
     if (layout?.enabled && layout.extraction.enabled) feedbackBackground.wake(ctx, invokeV2For(ctx), layout.extraction.provider.thinkingLevel);
@@ -1403,28 +1405,49 @@ export function preferenceExtension(pi: ExtensionAPI): void {
     ctx: ExtensionCommandContext,
     forcedStorageMode?: "local_only" | "ask",
   ): Promise<void> {
+    let targets = feedbackContext.available(ctx);
+    if (!targets.length) targets = feedbackContext.restore(ctx);
+    if (!targets.length) {
+      safeNotify(ctx, "本次反馈未保存：当前活动分支没有可引用的完整用户请求与最终助手回复（stop）。请先让助手完成最终回复，或用 /tree 回到最终助手回复节点，再重新执行 /pref feedback。", "warning");
+      return;
+    }
+    let selected = targets.at(-1)!;
+    if (targets.length > 1 && ctx.hasUI) {
+      const choice = await ctx.ui.select("选择要评价的会话结果", targets.map((target) => `${target.taskKey} · ${target.userText.slice(0, 80)}`));
+      if (!choice) {
+        safeNotify(ctx, "本次反馈未保存：已取消选择会话结果。", "info");
+        return;
+      }
+      selected = targets.find((target) => choice.startsWith(target.taskKey)) ?? selected;
+    }
+    const layout = await loadLayout();
+    if (!layout.enabled) throw new Error("个人偏好未启用");
     let sentiment = command.sentiment;
     let reason = command.reason;
     if (!sentiment) {
       if (!ctx.hasUI) throw new Error("feedback 在无 UI 模式下需要使用 good 或 fix");
       for (;;) {
         const choice = await ctx.ui.select("评价当前结果", ["满意", "需要改进", "返回上一级"]);
-        if (!choice || choice === "返回上一级") return;
+        if (!choice || choice === "返回上一级") {
+          safeNotify(ctx, "本次反馈未保存：已取消填写反馈。", "info");
+          return;
+        }
         if (choice === "满意") { sentiment = "good"; break; }
         reason = (await ctx.ui.input("需要改进的原因", "请说明原因"))?.trim();
         if (reason) { sentiment = "fix"; break; }
       }
     }
     if (sentiment === "fix" && !reason?.trim()) throw new Error("feedback fix requires a reason");
-    const layout = await loadLayout();
-    if (!layout.enabled) throw new Error("个人偏好未启用");
     const feedback = reason?.trim() ? `${sentiment}: ${reason.trim()}` : sentiment;
     const groups = await readGroups();
     let group: string | undefined = command.group;
     if (!group) {
       if (!ctx.hasUI) throw new Error("feedback 在无 UI 模式下需要使用 --group");
       group = await ctx.ui.select("选择反馈所属组", groups.map((item) => item.name));
-      if (!group) return;
+      if (!group) {
+        safeNotify(ctx, "本次反馈未保存：已取消选择反馈所属组。", "info");
+        return;
+      }
     }
     if (!groups.some((item) => item.name === group)) throw new Error(`unknown preference group: ${group}`);
     const v2: InvokeV2 = async (name, request, signal, timeoutMs = 60_000) => {
@@ -1432,19 +1455,13 @@ export function preferenceExtension(pi: ExtensionAPI): void {
       if (response.data && response.cas) (response.data as Record<string, unknown>).__cas_generation = response.cas.generation;
       return response;
     };
-    let targets = feedbackContext.available(ctx);
-    if (!targets.length) targets = feedbackContext.restore(ctx);
-    if (!targets.length) { safeNotify(ctx, "当前分支没有已完成且可引用的用户与助手消息；请先选择完成的会话结果。", "warning"); return; }
-    let selected = targets.at(-1)!;
-    if (targets.length > 1 && ctx.hasUI) {
-      const choice = await ctx.ui.select("选择要评价的会话结果", targets.map((target) => `${target.taskKey} · ${target.userText.slice(0, 80)}`));
-      if (!choice) return;
-      selected = targets.find((target) => choice.startsWith(target.taskKey)) ?? selected;
-    }
     let storageMode = forcedStorageMode ?? layout.privacyContextMode;
     if (!ctx.hasUI && storageMode === "ask") storageMode = "local_only";
     let snapshot = feedbackContext.snapshot(ctx, selected.taskKey, storageMode);
-    if (!snapshot) { safeNotify(ctx, "选择的反馈目标已不在当前会话分支，需重新选择。", "warning"); return; }
+    if (!snapshot) {
+      safeNotify(ctx, "本次反馈未保存：选择的会话结果已不在当前活动分支。请重新选择完整的最终助手回复，再执行 /pref feedback。", "warning");
+      return;
+    }
     let selection: FeedbackModelSelection | undefined;
     let consentRevision = 0;
     if (storageMode === "ask") {
@@ -1484,10 +1501,10 @@ export function preferenceExtension(pi: ExtensionAPI): void {
       consent_revision: consentRevision,
     }, layout.extraction.provider.thinkingLevel, layout.extraction.enabled && Boolean(selection && consentRevision));
     const message = storageMode === "local_only"
-      ? `反馈已仅保存在本机且未发送：${jobId}`
+      ? `反馈已保存（仅本机，未发送）：${jobId}`
       : selection
-        ? `反馈已本机入队：${jobId}`
-        : `反馈已本机保存且未绑定模型：${jobId}`;
+        ? `反馈已保存并入队：${jobId}`
+        : `反馈已保存（未绑定模型，未发送）：${jobId}`;
     safeNotify(ctx, message, "info");
   }
 

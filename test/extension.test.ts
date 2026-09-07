@@ -184,7 +184,7 @@ function feedbackCommandHarness(_session: SessionManager): { handler: (args: str
 function sessionWithFeedbackTarget(): SessionManager {
   const session = SessionManager.inMemory("/workspace");
   session.appendMessage({ role: "user", content: "请给出简洁结论", timestamp: Date.now() } as any);
-  session.appendMessage({ role: "assistant", content: [{ type: "text", text: "这是当前结果" }], timestamp: Date.now() } as any);
+  session.appendMessage({ role: "assistant", content: [{ type: "text", text: "这是当前结果" }], stopReason: "stop", timestamp: Date.now() } as any);
   new FeedbackContext().markSettled(ctxFor(session), (marker) => session.appendCustomEntry("personal-preferences-feedback-target", marker));
   return session;
 }
@@ -194,7 +194,7 @@ test("feedback context uses real active branch references and restores after rel
   const firstUserId = session.appendMessage({ role: "user", content: "请解释同步状态", timestamp: Date.now() } as any);
   session.appendMessage({ role: "tool", content: "secret raw tool output", timestamp: Date.now() } as any);
   session.appendMessage({ role: "user", content: "补充说明也要区分完成与完整", timestamp: Date.now() } as any);
-  session.appendMessage({ role: "assistant", content: [{ type: "thinking", thinking: "private" }, { type: "text", text: "同步流程已结束，并说明了完整性。" }], timestamp: Date.now() } as any);
+  session.appendMessage({ role: "assistant", content: [{ type: "thinking", thinking: "private" }, { type: "text", text: "同步流程已结束，并说明了完整性。" }], stopReason: "stop", timestamp: Date.now() } as any);
   const context = new FeedbackContext();
   const target = context.markSettled(ctxFor(session), (marker) => session.appendCustomEntry("personal-preferences-feedback-target", marker));
   assert.ok(target);
@@ -210,6 +210,77 @@ test("feedback context uses real active branch references and restores after rel
   session.branch(session.getEntry(target!.userEntryId)!.id);
   assert.equal(restored.available(ctxFor(session)).length, 0);
   assert.equal(restored.snapshot(ctxFor(session), target!.taskKey, "ask"), undefined);
+});
+
+test("real feedback UI and command report unsaved before prompting when no complete source exists", async () => {
+  const root = tempRoot();
+  const previous = process.env.PI_PREFERENCE_DATA_ROOT;
+  process.env.PI_PREFERENCE_DATA_ROOT = root;
+  try {
+    init(root);
+    const uiAttempt = createExtensionHarness(root, { session: SessionManager.inMemory(root), modelResponse: "{}" });
+    await uiAttempt.command.handler("feedback", uiAttempt.ctx);
+    assert.equal(uiAttempt.calls.length, 0);
+    assert.equal(uiAttempt.authCalls, 0);
+    assert.equal(uiAttempt.sends, 0);
+    assert.match(uiAttempt.notices.at(-1)?.message ?? "", /本次反馈未保存.*最终助手回复.*重新执行 \/pref feedback/su);
+
+    const commandAttempt = createExtensionHarness(root, { session: SessionManager.inMemory(root), modelResponse: "{}" });
+    await commandAttempt.command.handler("feedback --group global good", commandAttempt.ctx);
+    assert.equal(commandAttempt.authCalls, 0);
+    assert.equal(commandAttempt.sends, 0);
+    assert.match(commandAttempt.notices.at(-1)?.message ?? "", /本次反馈未保存/u);
+    assert.equal(existsSync(join(root, "local/feedback-jobs.json")), false);
+  } finally {
+    if (previous === undefined) delete process.env.PI_PREFERENCE_DATA_ROOT; else process.env.PI_PREFERENCE_DATA_ROOT = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("real feedback command persists a markerless legacy target before reporting its job ID", async () => {
+  const root = tempRoot();
+  const previous = process.env.PI_PREFERENCE_DATA_ROOT;
+  process.env.PI_PREFERENCE_DATA_ROOT = root;
+  try {
+    init(root);
+    setConfig(root, (config) => { config.privacy.context_mode = "local_only"; });
+    const session = SessionManager.inMemory(root);
+    session.appendMessage({ role: "user", content: "旧会话真实请求", timestamp: Date.now() } as any);
+    session.appendMessage({ role: "assistant", content: [{ type: "text", text: "旧会话真实最终回复" }], stopReason: "stop", timestamp: Date.now() } as any);
+    const harness = createExtensionHarness(root, { session });
+
+    await harness.command.handler("feedback --group global good", harness.ctx);
+
+    const jobs = JSON.parse(readFileSync(join(root, "local/feedback-jobs.json"), "utf8"));
+    assert.equal(jobs.length, 1);
+    assert.match(harness.notices.at(-1)?.message ?? "", new RegExp(`已保存.*${jobs[0].job_id}`, "u"));
+    assert.equal(jobs[0].snapshot_ref !== null, true);
+  } finally {
+    if (previous === undefined) delete process.env.PI_PREFERENCE_DATA_ROOT; else process.env.PI_PREFERENCE_DATA_ROOT = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cancelling feedback content selection creates no job and never reports success", async () => {
+  const root = tempRoot();
+  const previous = process.env.PI_PREFERENCE_DATA_ROOT;
+  process.env.PI_PREFERENCE_DATA_ROOT = root;
+  try {
+    init(root);
+    const session = SessionManager.inMemory(root);
+    session.appendMessage({ role: "user", content: "可评价请求", timestamp: Date.now() } as any);
+    session.appendMessage({ role: "assistant", content: [{ type: "text", text: "可评价最终回复" }], stopReason: "stop", timestamp: Date.now() } as any);
+    const harness = createExtensionHarness(root, { session, selects: [undefined] });
+
+    await harness.command.handler("feedback", harness.ctx);
+
+    assert.equal(existsSync(join(root, "local/feedback-jobs.json")), false);
+    assert.doesNotMatch(harness.notices.map((notice) => notice.message).join("\n"), /已保存|已入队/u);
+    assert.match(harness.notices.at(-1)?.message ?? "", /本次反馈未保存.*取消/u);
+  } finally {
+    if (previous === undefined) delete process.env.PI_PREFERENCE_DATA_ROOT; else process.env.PI_PREFERENCE_DATA_ROOT = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("latest command grammar has no compatibility domain or evolve paths", () => {
@@ -1209,7 +1280,7 @@ test("real end-to-end preference learning spans two SessionManagers, two devices
     const makeSession = (index: number): SessionManager => {
       const session = SessionManager.inMemory(workspace);
       session.appendMessage({ role: "user", content: `任务 ${index}：请先给出结论，再说明依据`, timestamp: Date.now() } as any);
-      session.appendMessage({ role: "assistant", content: [{ type: "text", text: `任务 ${index} 的结论与依据` }], timestamp: Date.now() } as any);
+      session.appendMessage({ role: "assistant", content: [{ type: "text", text: `任务 ${index} 的结论与依据` }], stopReason: "stop", timestamp: Date.now() } as any);
       new FeedbackContext().markSettled(ctxFor(session), (marker) => session.appendCustomEntry("personal-preferences-feedback-target", marker));
       return session;
     };
@@ -1423,7 +1494,7 @@ test("real settings shutdown aborts active stage work, releases the shared worke
     await enableProposals.command.handler("", enableProposals.ctx);
     const session = SessionManager.inMemory(workspace);
     session.appendMessage({ role: "user", content: "请整理这次结果", timestamp: Date.now() } as any);
-    session.appendMessage({ role: "assistant", content: [{ type: "text", text: "这是结果" }], timestamp: Date.now() } as any);
+    session.appendMessage({ role: "assistant", content: [{ type: "text", text: "这是结果" }], stopReason: "stop", timestamp: Date.now() } as any);
     new FeedbackContext().markSettled(ctxFor(session), (marker) => session.appendCustomEntry("personal-preferences-feedback-target", marker));
     activeHarness = createExtensionHarness(workspace, { session, confirms: [true] });
     await activeHarness.command.handler("feedback --group global fix 请整理结果并保留必要依据", activeHarness.ctx);
@@ -1552,7 +1623,7 @@ test("real evidence revise and restore trigger the configured new-evidence path"
     await optIn.command.handler("", optIn.ctx);
     const session = SessionManager.inMemory(workspace);
     session.appendMessage({ role: "user", content: "请给出简洁结论", timestamp: Date.now() } as any);
-    session.appendMessage({ role: "assistant", content: [{ type: "text", text: "原始回答结果" }], timestamp: Date.now() } as any);
+    session.appendMessage({ role: "assistant", content: [{ type: "text", text: "原始回答结果" }], stopReason: "stop", timestamp: Date.now() } as any);
     new FeedbackContext().markSettled(ctxFor(session), (marker) => session.appendCustomEntry("personal-preferences-feedback-target", marker));
     const feedback = createExtensionHarness(workspace, { session, confirms: [true] });
     await feedback.command.handler("feedback --group global fix 请保留简洁结论", feedback.ctx);
