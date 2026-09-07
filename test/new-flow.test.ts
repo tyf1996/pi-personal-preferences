@@ -14,9 +14,8 @@ import { recentConversationTurns, selectConversationTurns, type ConversationTurn
 initTheme("dark", false);
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const repoRoot = resolve(packageRoot, "../..");
-const cliPath = join(repoRoot, "skills/wikiskill/scripts/wikiskill_preference.py");
-const pythonRoot = join(repoRoot, "skills/wikiskill/scripts");
+const pythonRoot = join(packageRoot, "python");
+const cliPath = join(pythonRoot, "wikiskill_preference.py");
 
 type Json = Record<string, any>;
 type ModelReply = Json | string | Error;
