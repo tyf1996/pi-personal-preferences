@@ -47,10 +47,16 @@ def _validated_base_url(value: str) -> str:
     return value
 
 
-def call_openai_compatible(config: PreferenceConfig, prompt: str) -> str:
-    """Call the configured OpenAI-compatible endpoint without exposing secrets."""
+def call_openai_compatible_result(
+    config: PreferenceConfig,
+    prompt: str,
+    selection: dict[str, Any] | None = None,
+    *,
+    provider_override: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Call the configured endpoint and return bounded text plus verified usage metadata."""
 
-    provider = config.provider
+    provider = config.provider if provider_override is None else provider_override
     if provider["name"] == "pi":
         raise PreferenceEvolutionError("Pi model calls must be bridged through the Pi extension")
     api_key_env = str(provider["api_key_env"])
@@ -64,16 +70,16 @@ def call_openai_compatible(config: PreferenceConfig, prompt: str) -> str:
         raise PreferenceEvolutionError("provider credential contains a forbidden newline")
     endpoint = _validated_base_url(str(base_url))
     request_body: dict[str, Any] = {
-        "model": provider["model"],
+        "model": selection["model_id"] if selection is not None else provider["model"],
         "messages": [
             {"role": "system", "content": "Return only the requested JSON object."},
             {"role": "user", "content": prompt},
         ],
         "temperature": provider.get("temperature", 0),
-        "max_tokens": provider.get("max_tokens", 2048),
+        "max_tokens": selection["max_tokens"] if selection is not None else provider.get("max_tokens", 2048),
         "response_format": {"type": "json_object"},
     }
-    thinking_level = str(provider["thinking_level"])
+    thinking_level = str(selection["thinking_level"] if selection is not None else provider["thinking_level"])
     if thinking_level != "off":
         request_body["reasoning_effort"] = thinking_level
     request = urllib.request.Request(
@@ -82,7 +88,7 @@ def call_openai_compatible(config: PreferenceConfig, prompt: str) -> str:
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
         method="POST",
     )
-    timeout = float(provider.get("timeout_seconds", 60))
+    timeout = float(selection["timeout_seconds"] if selection is not None else provider.get("timeout_seconds", 60))
     try:
         with _open_without_redirect(request, timeout) as response:
             payload = response.read(MAX_RESPONSE_BYTES + 1)
@@ -102,4 +108,45 @@ def call_openai_compatible(config: PreferenceConfig, prompt: str) -> str:
         content = "".join(str(item.get("text", "")) if isinstance(item, dict) else str(item) for item in content)
     if not isinstance(content, str):
         raise PreferenceEvolutionError("provider response content must be text")
-    return content
+    raw_usage = decoded.get("usage") if isinstance(decoded, dict) else None
+    prompt_tokens = raw_usage.get("prompt_tokens") if isinstance(raw_usage, dict) else None
+    completion_tokens = raw_usage.get("completion_tokens") if isinstance(raw_usage, dict) else None
+    total_tokens = raw_usage.get("total_tokens") if isinstance(raw_usage, dict) else None
+    known = (
+        type(prompt_tokens) is int and prompt_tokens >= 0
+        and type(completion_tokens) is int and completion_tokens >= 0
+    )
+    if known and (type(total_tokens) is not int or total_tokens < 0):
+        total_tokens = prompt_tokens + completion_tokens
+    selected_model = str(selection["model_id"] if selection is not None else provider["model"])
+    selected_limit = int(selection["max_tokens"] if selection is not None else provider.get("max_tokens", 2048))
+    usage = {
+        "known": known,
+        "input_tokens": prompt_tokens if known else None,
+        "output_tokens": completion_tokens if known else None,
+        "total_tokens": total_tokens if known else None,
+        # The OpenAI-compatible response contract does not provide reliable
+        # billing data. A missing cost is unknown, never zero.
+        "cost_usd": None,
+        "cost_status": "unknown",
+        "provider_id": "fake" if provider["name"] == "fake" else "openai_compatible",
+        "model_id": selected_model,
+        "max_tokens": selected_limit,
+    }
+    return content, usage
+
+
+def call_openai_compatible(
+    config: PreferenceConfig,
+    prompt: str,
+    selection: dict[str, Any] | None = None,
+    *,
+    provider_override: dict[str, Any] | None = None,
+) -> str:
+    """Text-only wrapper retained for deterministic group classification."""
+    return call_openai_compatible_result(
+        config,
+        prompt,
+        selection,
+        provider_override=provider_override,
+    )[0]

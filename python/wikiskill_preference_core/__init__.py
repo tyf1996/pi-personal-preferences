@@ -7,30 +7,42 @@ from .contracts import (
     EvolutionChange,
     EvolutionResponse,
     GroupActivationDocument,
+    GroupActivationDocumentV2,
     GroupClassificationRequest,
     GroupClassificationResult,
     PreferenceEvent,
     PreferenceGroup,
+    PreferenceGroupV2,
     PreferenceGroupsDocument,
+    PreferenceGroupsDocumentV2,
+    PreferenceRuleV2,
     Signal,
 )
-from .evolution import evolve_preferences
+from .learning_contracts import Change, Proposal, ProposalJob
+from .proposals import ProposalStore
 from .store import PreferenceStore
 
 __all__ = [
+    "Change",
     "EvolutionAction",
     "EvolutionChange",
     "EvolutionResponse",
     "GroupActivationDocument",
+    "GroupActivationDocumentV2",
     "GroupClassificationRequest",
     "GroupClassificationResult",
     "PreferenceConfig",
     "PreferenceEvent",
     "PreferenceGroup",
+    "PreferenceGroupV2",
     "PreferenceGroupsDocument",
+    "PreferenceGroupsDocumentV2",
+    "PreferenceRuleV2",
     "PreferenceStore",
+    "Proposal",
+    "ProposalJob",
+    "ProposalStore",
     "Signal",
     "classify_group",
     "default_config",
-    "evolve_preferences",
 ]

@@ -4,22 +4,35 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import tempfile
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
 from .config import PreferenceConfig, default_config
 from .contracts import (
+    ACTIVATIONS_SCHEMA_VERSION_V1,
+    ACTIVATIONS_SCHEMA_VERSION_V2,
+    GROUPS_SCHEMA_VERSION_V1,
+    GROUPS_SCHEMA_VERSION_V2,
+    VERSION_SCHEMA_VERSION_V2,
     GroupActivationDocument,
+    GroupActivationDocumentV2,
     PreferenceEvent,
     PreferenceGroup,
+    PreferenceGroupV2,
     PreferenceGroupsDocument,
+    PreferenceGroupsDocumentV2,
+    PreferenceRuleV2,
     Signal,
     groups_document,
-    parse_activations_document,
-    parse_groups_document,
+    groups_document_v2,
+    new_id,
+    parse_activations_document_versioned,
+    parse_groups_document_versioned,
     stable_json_dumps,
     utc_now,
 )
@@ -27,9 +40,12 @@ from .errors import PreferenceContractError, PreferenceIntegrityError, Preferenc
 from .sanitizing import DEFAULT_DENIED_FILE_NAMES, path_is_denied, sanitize_text, safe_relative_project_path
 
 DEVICE_KEYS = {"schema_version", "device_id"}
-VERSION_KEYS = {"schema_version", "generator_version", "generated_at", "evidence_cursors", "model"}
-ACTIVATIONS_DEFAULT = {"schema_version": 1, "directories": {}, "sessions": {}}
-GENERATOR_VERSION = "wikiskill-personal-preferences/1"
+VERSION_KEYS_V2 = {
+    "schema_version", "generator_version", "generated_at", "repo_id", "migration_id",
+    "evidence_cursors", "model", "legacy_evidence",
+}
+ACTIVATIONS_DEFAULT = {"schema_version": ACTIVATIONS_SCHEMA_VERSION_V1, "directories": {}, "sessions": {}}
+GENERATOR_VERSION_V2 = "wikiskill-personal-preferences/2"
 _MAX_RAW_DIFF_BYTES = 512 * 1024
 
 
@@ -52,9 +68,37 @@ def _regular_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def _existing_directory(path: Path) -> None:
+    if path.is_symlink():
+        raise PreferenceIntegrityError(f"symlink is not allowed: {path}")
+    if not path.is_dir():
+        raise PreferenceStorageError(f"expected an existing directory: {path}")
+
+
+def _write_locked(method):
+    def locked(self, *args, **kwargs):
+        from .transactions import active_transaction_for, data_root_lock, recover_transactions
+
+        with data_root_lock(self.root):
+            if active_transaction_for(self.root / "config.json") is None:
+                recover_transactions(self.root)
+            return method(self, *args, **kwargs)
+
+    locked.__name__ = method.__name__
+    locked.__doc__ = method.__doc__
+    return locked
+
+
 def atomic_write_bytes(path: Path, content: bytes) -> None:
     """Write a file with fsync and an atomic replace in its parent directory."""
 
+    from .transactions import active_transaction_for, secure_atomic_write
+
+    transaction = active_transaction_for(path)
+    if transaction is not None:
+        transaction.record_after(path, content)
+        secure_atomic_write(transaction.data_root, path, content)
+        return
     _regular_directory(path.parent)
     if path.is_symlink():
         raise PreferenceIntegrityError(f"cannot replace symlink: {path}")
@@ -134,14 +178,31 @@ def _append_jsonl(path: Path, value: dict[str, Any]) -> None:
     _regular_directory(path.parent)
     if path.is_symlink():
         raise PreferenceIntegrityError(f"cannot append to symlink: {path}")
-    line = stable_json_dumps(value) + "\n"
-    try:
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(line)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except OSError as exc:
-        raise PreferenceStorageError(f"cannot append {path}: {exc}") from exc
+    existing = path.read_bytes() if path.exists() else b""
+    line = (stable_json_dumps(value) + "\n").encode("utf-8")
+    atomic_write_bytes(path, existing + line)
+
+
+def atomic_delete(path: Path) -> None:
+    from .transactions import active_transaction_for, secure_atomic_delete
+
+    transaction = active_transaction_for(path)
+    if transaction is not None:
+        transaction.record_after(path, None)
+        secure_atomic_delete(transaction.data_root, path)
+        return
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise PreferenceIntegrityError(f"cannot delete unsafe path: {path}")
+    if path.exists():
+        path.unlink()
+        try:
+            directory_fd = os.open(path.parent, os.O_DIRECTORY)
+        except (AttributeError, OSError):
+            return
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
 
 def _unique_event_key(event: PreferenceEvent) -> tuple[str, str | None, str, str]:
@@ -164,40 +225,53 @@ class PreferenceStore:
 
     @classmethod
     def init(cls, data_root: str | Path) -> "PreferenceStore":
+        from .transactions import data_root_lock, recover_transactions
+
         root = Path(data_root).resolve()
-        _regular_directory(root)
-        config_path = root / "config.json"
-        created_config = False
-        if config_path.exists():
-            config = PreferenceConfig.load(root)
-        else:
-            config = default_config(root)
-            atomic_write_text(config_path, stable_json_dumps(config.to_dict()) + "\n")
-            created_config = True
-        try:
-            store = cls(root)
-            store._initialize_files(config)
-            return store
-        except Exception:
-            if created_config and config_path.is_file() and not config_path.is_symlink():
-                config_path.unlink()
-            raise
+        with data_root_lock(root):
+            recover_transactions(root)
+            _regular_directory(root)
+            config_path = root / "config.json"
+            created_config = False
+            if config_path.exists():
+                config = PreferenceConfig.load(root)
+            else:
+                config = default_config(root)
+                atomic_write_text(config_path, stable_json_dumps(config.to_dict()) + "\n")
+                created_config = True
+            try:
+                _regular_directory(config.local_root)
+                _regular_directory(config.repo_root)
+                _regular_directory(config.repo_root / "evidence")
+                store = cls(root)
+                store._initialize_files(config)
+                return store
+            except Exception:
+                if created_config and config_path.is_file() and not config_path.is_symlink():
+                    atomic_delete(config_path)
+                raise
 
     def _validate_layout(self) -> None:
-        _regular_directory(self.root)
-        _regular_directory(self.local)
-        _regular_directory(self.repo)
-        _regular_directory(self.repo / "evidence")
+        _existing_directory(self.root)
+        _existing_directory(self.local)
+        _existing_directory(self.repo)
+        _existing_directory(self.repo / "evidence")
 
     def _initialize_files(self, config: PreferenceConfig) -> None:
-        from .git_sync import begin_generated_transaction, restore_generated_transaction
+        from .git_sync import (
+            begin_generated_transaction,
+            complete_generated_transaction,
+            restore_generated_transaction,
+        )
 
         transaction = begin_generated_transaction(
             self.repo,
             extra_paths=(self.device_path, self.local_root),
+            data_root=self.root,
         )
         try:
             self._initialize_files_unchecked(config)
+            complete_generated_transaction(transaction)
         except Exception:
             restore_generated_transaction(transaction)
             raise
@@ -231,20 +305,18 @@ class PreferenceStore:
                 atomic_write_text(path, "")
 
         if self.groups_path.exists():
-            self.read_groups()
+            self.read_groups_v2()
         else:
-            self.write_groups([
-                PreferenceGroup(
-                    name="global",
-                    description="适用于所有 Pi 会话的通用个人偏好。",
-                    rules=[],
-                ),
-            ])
+            self.write_groups_v2([PreferenceGroupV2(
+                id=new_id("grp-"), revision=1, name="global",
+                description="适用于所有 Pi 会话的通用个人偏好。", rules=(),
+            )])
 
         if self.activations_path.exists():
             self.read_activations()
         else:
-            atomic_write_text(self.activations_path, stable_json_dumps(ACTIVATIONS_DEFAULT) + "\n")
+            initial_activations = {"schema_version": ACTIVATIONS_SCHEMA_VERSION_V2, "directories": {}, "sessions": {}}
+            atomic_write_text(self.activations_path, stable_json_dumps(initial_activations) + "\n")
 
         if self.last_run_path.exists():
             _regular_file(self.last_run_path, allow_missing=False)
@@ -315,24 +387,21 @@ class PreferenceStore:
         return device_id
 
     def default_version(self) -> dict[str, Any]:
-        return {
-            "schema_version": 1,
-            "generator_version": GENERATOR_VERSION,
-            "generated_at": utc_now(),
-            "evidence_cursors": {},
-            "model": None,
-        }
+        return {"schema_version": VERSION_SCHEMA_VERSION_V2, "generator_version": GENERATOR_VERSION_V2,
+                "generated_at": utc_now(), "repo_id": new_id("repo-"), "migration_id": "direct-v2",
+                "evidence_cursors": {}, "model": None, "legacy_evidence": []}
 
     def read_version(self) -> dict[str, Any]:
         value = _read_json(self.version_path, "version")
-        if not isinstance(value, dict) or set(value) != VERSION_KEYS:
-            raise PreferenceIntegrityError("version.json has an invalid shape")
-        if (
-            type(value.get("schema_version")) is not int
-            or value.get("schema_version") != 1
-            or value.get("generator_version") != GENERATOR_VERSION
-        ):
-            raise PreferenceIntegrityError("version.json has an unsupported schema or generator")
+        if not isinstance(value, dict):
+            raise PreferenceIntegrityError("version.json must be an object")
+        version = value.get("schema_version")
+        expected_keys = VERSION_KEYS_V2
+        expected_generator = GENERATOR_VERSION_V2
+        if version != VERSION_SCHEMA_VERSION_V2:
+            raise PreferenceIntegrityError(f"version.json schema_version is unsupported: {version!r}")
+        if set(value) != expected_keys or value.get("generator_version") != expected_generator:
+            raise PreferenceIntegrityError("version.json has an invalid shape or generator")
         if value.get("model") is not None and not isinstance(value.get("model"), str):
             raise PreferenceIntegrityError("version model must be a string or null")
         cursors = value.get("evidence_cursors")
@@ -341,26 +410,93 @@ class PreferenceStore:
             for key, item in cursors.items()
         ):
             raise PreferenceIntegrityError("version evidence cursors are invalid")
+        if version == VERSION_SCHEMA_VERSION_V2:
+            generated_at = value.get("generated_at")
+            try:
+                parsed_time = datetime.fromisoformat(str(generated_at).replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise PreferenceIntegrityError("version generated_at is invalid") from exc
+            if parsed_time.tzinfo is None or parsed_time.utcoffset() is None:
+                raise PreferenceIntegrityError("version generated_at must include a timezone")
+            for key in ("repo_id", "migration_id"):
+                item = value.get(key)
+                if not isinstance(item, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", item):
+                    raise PreferenceIntegrityError(f"version {key} is invalid")
+            if any(
+                not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.jsonl", key)
+                for key in cursors
+            ):
+                raise PreferenceIntegrityError("version v2 evidence cursor path is invalid")
+            legacy = value.get("legacy_evidence")
+            if not isinstance(legacy, list):
+                raise PreferenceIntegrityError("version legacy_evidence must be a list")
+            seen_paths: set[str] = set()
+            for item in legacy:
+                if not isinstance(item, dict) or set(item) != {"path", "line_count", "digest"}:
+                    raise PreferenceIntegrityError("version legacy_evidence entry is invalid")
+                path = item["path"]
+                if (
+                    not isinstance(path, str)
+                    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.jsonl", path)
+                    or path in seen_paths
+                ):
+                    raise PreferenceIntegrityError("version legacy evidence path is invalid")
+                seen_paths.add(path)
+                if type(item["line_count"]) is not int or item["line_count"] < 0:
+                    raise PreferenceIntegrityError("version legacy evidence line_count is invalid")
+                digest = item["digest"]
+                if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                    raise PreferenceIntegrityError("version legacy evidence digest is invalid")
         return value
 
+    @_write_locked
     def write_version(self, *, cursors: dict[str, int], model: str | None) -> None:
+        previous = self.read_version()
         value = {
-            "schema_version": 1,
-            "generator_version": GENERATOR_VERSION,
+            **previous,
             "generated_at": utc_now(),
             "evidence_cursors": {key: int(cursors[key]) for key in sorted(cursors)},
             "model": model,
         }
         atomic_write_text(self.version_path, stable_json_dumps(value) + "\n")
 
-    def read_groups(self) -> list[PreferenceGroup]:
-        groups = parse_groups_document(_read_json(self.groups_path, "preference groups"))
+    def read_groups_document(self) -> PreferenceGroupsDocument | PreferenceGroupsDocumentV2:
+        document = parse_groups_document_versioned(_read_json(self.groups_path, "preference groups"))
+        if not isinstance(document, PreferenceGroupsDocumentV2):
+            raise PreferenceIntegrityError("preference groups must use schema_version=2")
+        groups = document.groups
         for group in groups:
-            if sanitize_text(group.description).changed or any(sanitize_text(rule).changed for rule in group.rules):
+            if sanitize_text(group.description).changed:
                 raise PreferenceIntegrityError("stored preference group is not sanitized")
-        return groups
+            rules = group.rules if isinstance(group, PreferenceGroup) else [rule.text for rule in group.rules]
+            if any(sanitize_text(rule).changed for rule in rules):
+                raise PreferenceIntegrityError("stored preference group is not sanitized")
+        return document
 
+    def groups_schema_version(self) -> int:
+        return self.read_groups_document().schema_version
+
+    def read_groups(self) -> list[PreferenceGroup]:
+        document = self.read_groups_document()
+        if isinstance(document, PreferenceGroupsDocumentV2):
+            return [group.legacy_view() for group in document.groups]
+        return document.groups
+
+    def read_groups_v2(self) -> list[PreferenceGroupV2]:
+        document = self.read_groups_document()
+        if not isinstance(document, PreferenceGroupsDocumentV2):
+            raise PreferenceContractError("groups document is not v2")
+        return document.groups
+
+    @_write_locked
+    def write_groups_v2(self, groups: Iterable[PreferenceGroupV2]) -> None:
+        normalized = [PreferenceGroupV2.from_dict(group.to_dict()) for group in groups]
+        normalized.sort(key=lambda group: (group.name != "global", group.name))
+        atomic_write_text(self.groups_path, stable_json_dumps(groups_document_v2(normalized)) + "\n")
+
+    @_write_locked
     def write_groups(self, groups: Iterable[PreferenceGroup] | PreferenceGroupsDocument) -> None:
+        raise PreferenceContractError("write_groups is unavailable; latest groups require stable IDs")
         values = groups.groups if isinstance(groups, PreferenceGroupsDocument) else groups
         normalized: list[PreferenceGroup] = []
         for group in values:
@@ -392,6 +528,13 @@ class PreferenceStore:
             raise PreferenceContractError(f"unknown preference group: {name}")
         return group
 
+    def _require_group_v2(self, name: str) -> PreferenceGroupV2:
+        group = next((item for item in self.read_groups_v2() if item.name == name), None)
+        if group is None:
+            raise PreferenceContractError(f"unknown preference group: {name}")
+        return group
+
+    @_write_locked
     def create_group(self, name: str, description: str) -> PreferenceGroup:
         raw_group = PreferenceGroup.from_dict({"name": name, "description": description, "rules": []})
         group = PreferenceGroup.from_dict({
@@ -399,12 +542,19 @@ class PreferenceStore:
             "description": sanitize_text(raw_group.description).text,
             "rules": [],
         })
+        if self.groups_schema_version() == GROUPS_SCHEMA_VERSION_V2:
+            groups = self.read_groups_v2()
+            if any(item.name == group.name for item in groups):
+                raise PreferenceContractError(f"preference group already exists: {group.name}")
+            self.write_groups_v2([*groups, PreferenceGroupV2(new_id("grp-"), 1, group.name, group.description, [])])
+            return group
         groups = self.read_groups()
         if any(item.name == group.name for item in groups):
             raise PreferenceContractError(f"preference group already exists: {group.name}")
         self.write_groups([*groups, group])
         return group
 
+    @_write_locked
     def update_group_description(self, name: str, description: str) -> PreferenceGroup:
         original = self._require_group(name)
         raw_group = PreferenceGroup.from_dict({
@@ -417,55 +567,102 @@ class PreferenceStore:
             "description": sanitize_text(raw_group.description).text,
             "rules": list(original.rules),
         })
+        if self.groups_schema_version() == GROUPS_SCHEMA_VERSION_V2:
+            groups = self.read_groups_v2()
+            current = self._require_group_v2(name)
+            replacement = PreferenceGroupV2(
+                current.id, current.revision + 1, current.name, validated.description, list(current.rules),
+            )
+            self.write_groups_v2([replacement if group.name == name else group for group in groups])
+            return replacement.legacy_view()
         self.write_groups([validated if group.name == name else group for group in self.read_groups()])
         return validated
 
+    @_write_locked
     def delete_group(self, name: str) -> PreferenceGroup:
         group = self._require_group(name)
-        self.write_groups([item for item in self.read_groups() if item.name != name])
+        if self.groups_schema_version() == GROUPS_SCHEMA_VERSION_V2:
+            self.write_groups_v2([item for item in self.read_groups_v2() if item.name != name])
+        else:
+            self.write_groups([item for item in self.read_groups() if item.name != name])
         self.remove_inbox_group(name)
         return group
 
+    def _validated_rule(self, group: str, description: str, rule: str) -> str:
+        raw_group = PreferenceGroup.from_dict({"name": group, "description": description, "rules": [rule]})
+        return sanitize_text(raw_group.rules[0]).text
+
+    @_write_locked
     def add_group_rule(self, group: str, rule: str) -> PreferenceGroup:
         current = self._require_group(group)
-        raw_group = PreferenceGroup.from_dict({"name": group, "description": current.description, "rules": [rule]})
-        validated = PreferenceGroup.from_dict({
-            "name": raw_group.name,
-            "description": current.description,
-            "rules": [sanitize_text(raw_group.rules[0]).text],
-        })
-        if validated.rules[0] in current.rules:
+        new_value = self._validated_rule(group, current.description, rule)
+        if new_value in current.rules:
             raise PreferenceContractError(f"preference rule already exists in group: {group}")
-        replacement = PreferenceGroup(current.name, current.description, [*current.rules, validated.rules[0]])
+        if self.groups_schema_version() == GROUPS_SCHEMA_VERSION_V2:
+            groups = self.read_groups_v2()
+            current_v2 = self._require_group_v2(group)
+            replacement = PreferenceGroupV2(
+                current_v2.id,
+                current_v2.revision + 1,
+                current_v2.name,
+                current_v2.description,
+                [*current_v2.rules, PreferenceRuleV2(new_id("rule-"), 1, new_value, True)],
+            )
+            self.write_groups_v2([replacement if item.name == group else item for item in groups])
+            return replacement.legacy_view()
+        replacement = PreferenceGroup(current.name, current.description, [*current.rules, new_value])
         self.write_groups([replacement if item.name == group else item for item in self.read_groups()])
         return replacement
 
+    @_write_locked
     def update_group_rule(self, group: str, old_rule: str, new_rule: str) -> PreferenceGroup:
         current = self._require_group(group)
         if old_rule not in current.rules:
             raise PreferenceContractError(f"unknown preference rule in group: {group}")
-        raw_group = PreferenceGroup.from_dict({"name": group, "description": current.description, "rules": [new_rule]})
-        validated = PreferenceGroup.from_dict({
-            "name": raw_group.name,
-            "description": current.description,
-            "rules": [sanitize_text(raw_group.rules[0]).text],
-        })
-        new_value = validated.rules[0]
+        new_value = self._validated_rule(group, current.description, new_rule)
         if new_value != old_rule and new_value in current.rules:
             raise PreferenceContractError(f"preference rule already exists in group: {group}")
-        rules = [new_value if item == old_rule else item for item in current.rules]
-        replacement = PreferenceGroup(current.name, current.description, rules)
+        if self.groups_schema_version() == GROUPS_SCHEMA_VERSION_V2:
+            groups = self.read_groups_v2()
+            current_v2 = self._require_group_v2(group)
+            rules = [
+                PreferenceRuleV2(item.id, item.revision + 1, new_value, item.enabled)
+                if item.text == old_rule else item
+                for item in current_v2.rules
+            ]
+            replacement_v2 = PreferenceGroupV2(
+                current_v2.id, current_v2.revision + 1, current_v2.name, current_v2.description, rules,
+            )
+            self.write_groups_v2([replacement_v2 if item.name == group else item for item in groups])
+            return replacement_v2.legacy_view()
+        replacement = PreferenceGroup(
+            current.name, current.description, [new_value if item == old_rule else item for item in current.rules],
+        )
         self.write_groups([replacement if item.name == group else item for item in self.read_groups()])
         return replacement
 
+    @_write_locked
     def delete_group_rule(self, group: str, rule: str) -> PreferenceGroup:
         current = self._require_group(group)
         if rule not in current.rules:
             raise PreferenceContractError(f"unknown preference rule in group: {group}")
+        if self.groups_schema_version() == GROUPS_SCHEMA_VERSION_V2:
+            groups = self.read_groups_v2()
+            current_v2 = self._require_group_v2(group)
+            replacement_v2 = PreferenceGroupV2(
+                current_v2.id,
+                current_v2.revision + 1,
+                current_v2.name,
+                current_v2.description,
+                [item for item in current_v2.rules if item.text != rule],
+            )
+            self.write_groups_v2([replacement_v2 if item.name == group else item for item in groups])
+            return replacement_v2.legacy_view()
         replacement = PreferenceGroup(current.name, current.description, [item for item in current.rules if item != rule])
         self.write_groups([replacement if item.name == group else item for item in self.read_groups()])
         return replacement
 
+    @_write_locked
     def move_group_rule(self, source_group: str, target_group: str, rule: str) -> tuple[PreferenceGroup, PreferenceGroup]:
         source = self._require_group(source_group)
         target = self._require_group(target_group)
@@ -475,6 +672,26 @@ class PreferenceStore:
             raise PreferenceContractError(f"unknown preference rule in source group: {source_group}")
         if rule in target.rules:
             raise PreferenceContractError(f"preference rule already exists in target group: {target_group}")
+        if self.groups_schema_version() == GROUPS_SCHEMA_VERSION_V2:
+            groups = self.read_groups_v2()
+            source_v2 = self._require_group_v2(source_group)
+            target_v2 = self._require_group_v2(target_group)
+            moved = next(item for item in source_v2.rules if item.text == rule)
+            updated_source_v2 = PreferenceGroupV2(
+                source_v2.id, source_v2.revision + 1, source_v2.name, source_v2.description,
+                [item for item in source_v2.rules if item.id != moved.id],
+            )
+            updated_target_v2 = PreferenceGroupV2(
+                target_v2.id, target_v2.revision + 1, target_v2.name, target_v2.description,
+                [*target_v2.rules, moved],
+            )
+            self.write_groups_v2([
+                updated_source_v2 if item.id == source_v2.id
+                else updated_target_v2 if item.id == target_v2.id
+                else item
+                for item in groups
+            ])
+            return updated_source_v2.legacy_view(), updated_target_v2.legacy_view()
         updated_source = PreferenceGroup(source.name, source.description, [item for item in source.rules if item != rule])
         updated_target = PreferenceGroup(target.name, target.description, [*target.rules, rule])
         self.write_groups([
@@ -485,11 +702,35 @@ class PreferenceStore:
         ])
         return updated_source, updated_target
 
-    def read_activations(self) -> GroupActivationDocument:
-        return parse_activations_document(_read_json(self.activations_path, "group activations"))
+    def read_activations_document(self) -> GroupActivationDocument | GroupActivationDocumentV2:
+        document = parse_activations_document_versioned(_read_json(self.activations_path, "group activations"))
+        if not isinstance(document, GroupActivationDocumentV2):
+            raise PreferenceIntegrityError("group activations must use schema_version=2")
+        return document
 
+    def read_activations(self) -> GroupActivationDocument:
+        document = self.read_activations_document()
+        if isinstance(document, GroupActivationDocument):
+            return document
+        by_id = {group.id: group.name for group in self.read_groups_v2()}
+        return GroupActivationDocument(
+            ACTIVATIONS_SCHEMA_VERSION_V1,
+            {key: [by_id[item] for item in values if item in by_id] for key, values in document.directories.items()},
+            {key: [by_id[item] for item in values if item in by_id] for key, values in document.sessions.items()},
+        )
+
+    @_write_locked
     def write_activations(self, document: GroupActivationDocument | dict[str, Any]) -> None:
         parsed = document if isinstance(document, GroupActivationDocument) else GroupActivationDocument.from_dict(document)
+        if isinstance(self.read_activations_document(), GroupActivationDocumentV2):
+            by_name = {group.name: group.id for group in self.read_groups_v2()}
+            converted = GroupActivationDocumentV2(
+                ACTIVATIONS_SCHEMA_VERSION_V2,
+                {key: [by_name[item] for item in values if item in by_name] for key, values in parsed.directories.items()},
+                {key: [by_name[item] for item in values if item in by_name] for key, values in parsed.sessions.items()},
+            )
+            atomic_write_text(self.activations_path, stable_json_dumps(converted.to_dict()) + "\n")
+            return
         atomic_write_text(self.activations_path, stable_json_dumps(parsed.to_dict()) + "\n")
 
     def _activation_groups(self, values: Iterable[str]) -> list[str]:
@@ -506,6 +747,7 @@ class PreferenceStore:
             raise PreferenceContractError("session_id must be a non-empty string")
         return self._activation_groups(self.read_activations().sessions.get(session_id, []))
 
+    @_write_locked
     def set_directory_group(self, directory: str, group: str, enabled: bool) -> list[str]:
         self._require_group(group)
         if group == "global":
@@ -525,9 +767,10 @@ class PreferenceStore:
             directories[directory] = list(dict.fromkeys(values))
         else:
             directories.pop(directory, None)
-        self.write_activations(GroupActivationDocument(1, directories, dict(document.sessions)))
+        self.write_activations(GroupActivationDocument(ACTIVATIONS_SCHEMA_VERSION_V1, directories, dict(document.sessions)))
         return self.directory_groups(directory)
 
+    @_write_locked
     def set_session_group(self, session_id: str, group: str, enabled: bool) -> list[str]:
         self._require_group(group)
         if group == "global":
@@ -547,7 +790,7 @@ class PreferenceStore:
             sessions[session_id] = list(dict.fromkeys(values))
         else:
             sessions.pop(session_id, None)
-        self.write_activations(GroupActivationDocument(1, dict(document.directories), sessions))
+        self.write_activations(GroupActivationDocument(ACTIVATIONS_SCHEMA_VERSION_V1, dict(document.directories), sessions))
         return self.session_groups(session_id)
 
     def effective_group_names(self, directory: str, session_id: str) -> list[str]:
@@ -561,18 +804,11 @@ class PreferenceStore:
                 result.append(name)
         return result
 
+    @_write_locked
     def append_inbox(self, event: PreferenceEvent, *, raw_diff: str | None = None) -> bool:
-        event.validate_for(self.group_names())
-        event = self._sanitized_event(event)
-        self._validate_raw_diff(raw_diff)
-        existing = [*self._all_local_events(), *self._all_evidence_events()]
-        key = _unique_event_key(event)
-        if any(_unique_event_key(item) == key or item.id == event.id for item in existing):
-            return False
-        _append_jsonl(self.inbox_path, event.to_dict())
-        self._store_raw_diff(event, raw_diff)
-        return True
+        raise PreferenceContractError("legacy feedback capture is unavailable; use feedback create")
 
+    @_write_locked
     def append_evidence(
         self,
         event: PreferenceEvent,
@@ -580,19 +816,7 @@ class PreferenceStore:
         raw_diff: str | None = None,
         allow_duplicate_key: bool = False,
     ) -> bool:
-        event.validate_for(self.group_names())
-        event = self._sanitized_event(event)
-        self._validate_raw_diff(raw_diff)
-        existing = [*self._all_evidence_events(), *self._all_local_events()]
-        key = _unique_event_key(event)
-        if any(item.id == event.id for item in existing):
-            return False
-        if not allow_duplicate_key and any(_unique_event_key(item) == key for item in existing):
-            return False
-        path = self.evidence_root / f"{self.device_id()}.jsonl"
-        _append_jsonl(path, event.to_dict())
-        self._store_raw_diff(event, raw_diff)
-        return True
+        raise PreferenceContractError("legacy evidence append is unavailable; use learning-job complete")
 
     def _sanitized_event(self, event: PreferenceEvent) -> PreferenceEvent:
         for path in event.paths:
@@ -625,6 +849,7 @@ class PreferenceStore:
     def inbox_events(self) -> list[PreferenceEvent]:
         return self._all_local_events()
 
+    @_write_locked
     def remove_inbox_group(self, group: str) -> int:
         events = self._all_local_events()
         removed = [event for event in events if event.group == group]
@@ -635,9 +860,7 @@ class PreferenceStore:
         atomic_write_text(self.inbox_path, content)
         for event in removed:
             path = self.raw_diff_root / f"{event.id}.diff"
-            if path.is_symlink():
-                raise PreferenceIntegrityError(f"symlink is not allowed: {path}")
-            path.unlink(missing_ok=True)
+            atomic_delete(path)
         return len(removed)
 
     def _all_local_events(self) -> list[PreferenceEvent]:
@@ -694,43 +917,15 @@ class PreferenceStore:
             current.setdefault(path.name, len(_read_jsonl(path, "evidence")))
         return events, current
 
+    @_write_locked
     def sync_inbox(self) -> dict[str, int]:
-        rows = _read_jsonl(self.inbox_path, "local inbox")
-        synced = 0
-        discarded = 0
-        existing = self._all_evidence_events()
-        keys = {_unique_event_key(event) for event in existing}
-        ids = {event.id for event in existing}
-        device_file = self.evidence_root / f"{self.device_id()}.jsonl"
-        group_names = self.group_names()
-        for row in rows:
-            event = PreferenceEvent.from_dict(row)
-            self._check_event_privacy(event)
-            if event.group not in group_names:
-                discarded += 1
-                raw_diff = self.raw_diff_root / f"{event.id}.diff"
-                if raw_diff.is_symlink():
-                    raise PreferenceIntegrityError(f"symlink is not allowed: {raw_diff}")
-                raw_diff.unlink(missing_ok=True)
-                continue
-            key = _unique_event_key(event)
-            if key in keys or event.id in ids:
-                if key in keys and event.id not in ids:
-                    raw_diff = self.raw_diff_root / f"{event.id}.diff"
-                    if raw_diff.is_symlink():
-                        raise PreferenceIntegrityError(f"symlink is not allowed: {raw_diff}")
-                    raw_diff.unlink(missing_ok=True)
-                continue
-            _append_jsonl(device_file, event.to_dict())
-            keys.add(key)
-            ids.add(event.id)
-            synced += 1
-        atomic_write_text(self.inbox_path, "")
-        return {"synced": synced, "discarded": discarded}
+        raise PreferenceContractError("legacy inbox sync is unavailable; use feedback jobs")
 
+    @_write_locked
     def append_metric(self, value: dict[str, Any]) -> None:
         _append_jsonl(self.metrics_path, {"created_at": utc_now(), **value})
 
+    @_write_locked
     def write_last_run(self, value: dict[str, Any]) -> None:
         atomic_write_text(self.last_run_path, stable_json_dumps(value) + "\n")
 

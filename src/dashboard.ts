@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import type { PreferenceCliInvoker } from "./group.ts";
 
 export interface PreferenceGroup {
+  id?: string;
   name: string;
   description: string;
   rules: string[];
@@ -10,21 +11,23 @@ export interface PreferenceGroup {
 
 export interface PreferenceStatus {
   enabled?: boolean;
-  auto_evolve?: boolean;
   groups?: number;
   rules?: number;
   pending_evidence_count?: number;
-  evolve_due?: boolean;
-  model_ready?: boolean;
+  pending_feedback_count?: number;
+  pending_evidence_withdrawal_publish_count?: number;
+  pending_proposal_count?: number;
+  pending_proposal_job_count?: number;
+  model_ready?: boolean | null;
   model_status?: string;
   provider_source?: string;
   provider_name?: string;
   provider_model?: string;
   provider_thinking_level?: string;
   provider_timeout_seconds?: number;
-  provider_base_url_ready?: boolean;
+  provider_base_url_ready?: boolean | null;
   provider_credential_env?: string;
-  provider_credential_ready?: boolean;
+  provider_credential_ready?: boolean | null;
   sync_state?: string;
   [key: string]: unknown;
 }
@@ -32,6 +35,12 @@ export interface PreferenceStatus {
 export interface DashboardActions {
   remember: (rule: string) => Promise<void>;
   feedback: () => Promise<void>;
+  feedbackLocalOnly?: () => Promise<void>;
+  manageFeedback?: () => Promise<void>;
+  manageEvidence?: () => Promise<void>;
+  manageProposals?: () => Promise<void>;
+  manageHistory?: () => Promise<void>;
+  manageSettings?: () => Promise<void>;
   sessionId: string;
 }
 
@@ -60,13 +69,14 @@ function parseGroups(value: Record<string, unknown>): PreferenceGroup[] {
     if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("groups CLI returned an invalid group");
     const group = item as Record<string, unknown>;
     if (typeof group.name !== "string" || typeof group.description !== "string" || !Array.isArray(group.rules)
-        || group.rules.some((rule) => typeof rule !== "string")) {
+        || group.rules.some((rule) => typeof rule !== "string" && (!rule || typeof rule !== "object" || Array.isArray(rule) || typeof (rule as Record<string, unknown>).text !== "string"))) {
       throw new Error("groups CLI returned an invalid group");
     }
     return {
+      ...(typeof group.id === "string" ? { id: group.id } : {}),
       name: group.name,
       description: group.description,
-      rules: group.rules as string[],
+      rules: group.rules.map((rule) => typeof rule === "string" ? rule : String((rule as Record<string, unknown>).text)),
     };
   });
 }
@@ -127,7 +137,15 @@ export function formatPreferenceSummary(status: PreferenceStatus, effectiveGroup
     `共${number(status.groups)}组/${number(status.rules)}规则`,
   ];
   const pending = number(status.pending_evidence_count);
-  if (pending > 0) parts.push(`${pending}条待处理${status.evolve_due === true ? "!" : ""}`);
+  const pendingFeedback = number(status.pending_feedback_count);
+  if (pendingFeedback > 0) parts.push(`${pendingFeedback}条整理中`);
+  if (pending > 0) parts.push(`${pending}条待复核`);
+  const pendingWithdrawals = number(status.pending_evidence_withdrawal_publish_count);
+  if (pendingWithdrawals > 0) parts.push(`${pendingWithdrawals}条撤回待发布`);
+  const pendingProposals = number(status.pending_proposal_count);
+  const pendingProposalJobs = number(status.pending_proposal_job_count);
+  if (pendingProposalJobs > 0) parts.push(`${pendingProposalJobs}条候选生成中`);
+  if (pendingProposals > 0) parts.push(`${pendingProposals}批候选待处理`);
   if (status.model_ready === false) parts.push("模型未就绪");
   parts.push(compactSync(status.sync_state));
   return parts.join(" · ");
@@ -140,7 +158,9 @@ function formatPreferenceDetails(status: PreferenceStatus): string {
   const timeout = number(status.provider_timeout_seconds);
   const model = status.model_ready === true
     ? `${source} ${provider} · thinking ${thinking} · timeout ${timeout}s`
-    : `${source} ${provider} · 未就绪：${text(status.model_status, "未配置")}`;
+    : status.model_ready === false
+      ? `${source} ${provider} · 未就绪：${text(status.model_status, "未配置")}`
+      : `${source} ${provider} · 未检查：${text(status.model_status, "仅在绑定或发送时检查")}`;
   return `模型：${model}\n同步：${text(status.sync_state, "error")}`;
 }
 
@@ -363,6 +383,12 @@ export async function showPreferenceDashboard(
       "为当前会话启用组",
       "为当前会话禁用组",
       "记录反馈",
+      "仅本机保存反馈",
+      "管理反馈任务",
+      "管理学习证据",
+      "生成与审核候选规则",
+      "查看规则来源与历史",
+      "学习设置与隐私",
       "同步偏好仓库",
       "撤销最近一次变化",
     ]);
@@ -407,6 +433,30 @@ export async function showPreferenceDashboard(
       await actions.feedback();
       continue;
     }
+    if (choice === "仅本机保存反馈") {
+      await actions.feedbackLocalOnly?.();
+      continue;
+    }
+    if (choice === "管理反馈任务") {
+      await actions.manageFeedback?.();
+      continue;
+    }
+    if (choice === "管理学习证据") {
+      await actions.manageEvidence?.();
+      continue;
+    }
+    if (choice === "生成与审核候选规则") {
+      await actions.manageProposals?.();
+      continue;
+    }
+    if (choice === "查看规则来源与历史") {
+      await actions.manageHistory?.();
+      continue;
+    }
+    if (choice === "学习设置与隐私") {
+      await actions.manageSettings?.();
+      continue;
+    }
     if (choice === "同步偏好仓库") {
       const result = await invokeCli(["sync"], undefined, 120_000);
       if (typeof result.push_error === "string") {
@@ -416,9 +466,17 @@ export async function showPreferenceDashboard(
       }
       continue;
     }
-    const confirmed = await ctx.ui.confirm("撤销最近一次变化？", "将通过 Git 新提交恢复最近一次组或规则变化。");
+    const preview = await invokeCli(["rollback", "--preview"], undefined, 120_000);
+    const confirmed = await ctx.ui.confirm("撤销最近一次变化？", [
+      `目标 operation：${text(preview.target_operation_id, "未知")}`,
+      `目标 commit：${text(preview.target_commit, "未知")}`,
+      `当前 HEAD：${text(preview.expected_head, "未知")}`,
+      `类型：${text(preview.kind, "未知")} · 时间：${text(preview.created_at, "未知")}`,
+      "将只撤销规则/组效果并追加 reverts_operation_id；evidence、withdraw 和审核历史保留：",
+      text(preview.diff, "无 diff"),
+    ].join("\n"));
     if (!confirmed) continue;
-    await invokeCli(["rollback"], undefined, 120_000);
-    ctx.ui.notify("最近一次偏好变化已撤销。", "info");
+    await invokeCli(["rollback", "--stdin"], { expected_operation_id: preview.target_operation_id, expected_head: preview.expected_head }, 120_000);
+    ctx.ui.notify("最近一次偏好 operation 已通过新提交撤销。", "info");
   }
 }

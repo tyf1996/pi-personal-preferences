@@ -39,10 +39,12 @@
   "scripts": {
     "sync-python": "node scripts/sync-python.mjs",
     "check-python": "node scripts/sync-python.mjs --check",
+    "test:python": "python3 -m unittest discover -s test/python -p 'test_*.py'",
+    "check:python-runtime": "npm run check-python && npm run test:python",
     "prepack": "npm run check-python",
     "test": "node --experimental-strip-types --test test/*.test.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "check": "npm run check-python && npm run typecheck && npm test"
+    "check": "npm run check:python-runtime && npm run typecheck && npm test"
   },
   "pi": {
     "extensions": [

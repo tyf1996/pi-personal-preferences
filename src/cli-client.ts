@@ -36,8 +36,13 @@ export function runPreferenceCli(
   input?: unknown,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   environment: CliEnvironment = {},
+  signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error("personal preference CLI aborted"));
+      return;
+    }
     const child = spawn("python3", [script, ...args, "--data-root", dataRoot], {
       stdio: ["pipe", "pipe", "pipe"],
       env: childEnvironment(environment),
@@ -48,11 +53,14 @@ export function runPreferenceCli(
     let outputBytes = 0;
     let finished = false;
     const timer = setTimeout(() => finishError(new Error("personal preference CLI timed out")), timeoutMs);
+    const abort = () => finishError(new Error("personal preference CLI aborted"));
+    signal?.addEventListener("abort", abort, { once: true });
 
     function finishError(error: Error): void {
       if (finished) return;
       finished = true;
       clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
       child.kill("SIGTERM");
       setTimeout(() => child.kill("SIGKILL"), 500).unref();
       reject(error);
@@ -75,17 +83,25 @@ export function runPreferenceCli(
       if (finished) return;
       finished = true;
       clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      try {
+        const value = JSON.parse(stdout) as unknown;
+        if (!isRecord(value)) throw new Error("result is not an object");
+        // v2 commands intentionally return an error envelope on stdout with exit 2.
+        // Preserve that structured result for the caller; legacy commands still
+        // reject because they write only a diagnostic to stderr on failure.
+        if (code === 0 || code === 2) {
+          resolve(value);
+          return;
+        }
+      } catch {
+        // Fall through to the redacted process failure below.
+      }
       if (code !== 0) {
         reject(new Error(redact(stderr.trim() || `personal preference CLI exited with ${code ?? "unknown"}`)));
         return;
       }
-      try {
-        const value = JSON.parse(stdout) as unknown;
-        if (!isRecord(value)) throw new Error("result is not an object");
-        resolve(value);
-      } catch {
-        reject(new Error("personal preference CLI returned invalid JSON"));
-      }
+      reject(new Error("personal preference CLI returned invalid JSON"));
     });
 
     if (input === undefined) child.stdin.end();

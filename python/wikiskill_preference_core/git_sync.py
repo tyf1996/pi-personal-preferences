@@ -8,14 +8,22 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from .errors import PreferenceGitError
 from .sanitizing import sanitize_text
+from .transactions import (
+    PersistentTransaction,
+    active_transaction_for,
+    build_git_sync_basis,
+    secure_atomic_delete,
+    secure_atomic_write,
+)
 
-GENERATED_PATHS = ("groups.json", "evidence", "version.json")
+GENERATED_PATHS = ("groups.json", "evidence", "version.json", "changes")
 GIT_ENV = {
     "GIT_TERMINAL_PROMPT": "0",
+    "GIT_OPTIONAL_LOCKS": "0",
     "GIT_AUTHOR_NAME": "Pi Personal Preferences",
     "GIT_AUTHOR_EMAIL": "pi-personal-preferences@localhost",
     "GIT_COMMITTER_NAME": "Pi Personal Preferences",
@@ -51,6 +59,7 @@ class GeneratedTransactionSnapshot:
     files: dict[Path, bytes]
     index_path: Path
     index_content: bytes | None
+    journal: PersistentTransaction | None = None
 
 
 def _atomic_write_bytes(path: Path, content: bytes) -> None:
@@ -81,6 +90,8 @@ def _snapshot_files(roots: Iterable[Path]) -> dict[Path, bytes]:
         if not root.is_dir():
             raise PreferenceGitError(f"transaction path must be a file or directory: {root}")
         for path in root.rglob("*"):
+            if path.name == "data.lock" or "transactions" in path.parts:
+                continue
             if path.is_symlink():
                 raise PreferenceGitError(f"transaction path cannot contain a symlink: {path}")
             if path.is_file():
@@ -110,6 +121,9 @@ def begin_generated_transaction(
     repo: str | Path,
     *,
     extra_paths: Iterable[str | Path] = (),
+    data_root: str | Path | None = None,
+    kind: str = "git",
+    sync_basis: Mapping[str, Any] | None = None,
 ) -> GeneratedTransactionSnapshot:
     """Capture generated files and the Git index before a local preference mutation."""
 
@@ -124,21 +138,43 @@ def begin_generated_transaction(
         *(path / name for name in GENERATED_PATHS),
         *(Path(item).resolve() for item in extra_paths),
     ]))
+    head = repository_head(path)
+    journal = None
+    if data_root is not None:
+        journal = PersistentTransaction.begin(
+            data_root,
+            kind=kind,
+            roots=roots,
+            repo=path,
+            base_head=head,
+            sync_basis=sync_basis,
+        )
+        journal.activate()
     return GeneratedTransactionSnapshot(
         repo=path,
-        head=repository_head(path),
+        head=head,
         roots=roots,
         files=_snapshot_files(roots),
         index_path=index_path,
         index_content=index_path.read_bytes() if index_path.exists() else None,
+        journal=journal,
     )
 
 
 def restore_generated_transaction(snapshot: GeneratedTransactionSnapshot) -> None:
     """Restore files, index, and HEAD-visible state after a failed local mutation."""
 
+    if snapshot.journal is not None:
+        snapshot.journal.deactivate()
     if repository_head(snapshot.repo) != snapshot.head:
         raise PreferenceGitError("cannot restore preference transaction because Git HEAD changed")
+    if snapshot.journal is not None:
+        if snapshot.index_content is None:
+            secure_atomic_delete(snapshot.repo, snapshot.index_path)
+        else:
+            secure_atomic_write(snapshot.repo, snapshot.index_path, snapshot.index_content)
+        snapshot.journal.rollback()
+        return
     current = _snapshot_files(snapshot.roots)
     for path in sorted(set(current) - set(snapshot.files), key=lambda item: len(item.parts), reverse=True):
         path.unlink(missing_ok=True)
@@ -159,6 +195,32 @@ def restore_generated_transaction(snapshot: GeneratedTransactionSnapshot) -> Non
         snapshot.index_path.unlink(missing_ok=True)
     else:
         _atomic_write_bytes(snapshot.index_path, snapshot.index_content)
+
+
+def _record_transaction_after(snapshot: GeneratedTransactionSnapshot) -> None:
+    journal = snapshot.journal
+    if journal is None:
+        return
+    current = _snapshot_files(snapshot.roots)
+    for path in sorted(set(snapshot.files) | set(current), key=lambda item: item.as_posix()):
+        journal.record_after(path, current.get(path))
+
+
+def complete_generated_transaction(snapshot: GeneratedTransactionSnapshot) -> None:
+    journal = snapshot.journal
+    if journal is None or not journal.directory.exists():
+        return
+    try:
+        head = repository_head(snapshot.repo)
+        if journal.manifest["kind"] == "git_sync":
+            journal.prepare_git_sync_after(head)
+        else:
+            _record_transaction_after(snapshot)
+        journal.record_commit_oid(head)
+        journal.commit_git(head)
+    except Exception:
+        journal.deactivate()
+        raise
 
 
 def ensure_repository(repo: str | Path) -> Path:
@@ -192,11 +254,20 @@ def repository_head(repo: str | Path) -> str | None:
 
 
 def _stage_generated(repo: Path) -> None:
-    _run(repo, ["add", "-A", "--", *GENERATED_PATHS])
+    paths = [
+        name for name in GENERATED_PATHS
+        if (repo / name).exists()
+        or _run(repo, ["ls-files", "--error-unmatch", "--", name], check=False).returncode == 0
+    ]
+    if paths:
+        _run(repo, ["add", "-A", "--", *paths])
 
 
 def commit_generated(repo: str | Path, message: str) -> str | None:
     path = ensure_repository(repo)
+    transaction = active_transaction_for(path / "groups.json")
+    if transaction is not None:
+        message = f"{message} {transaction.marker}"
     _stage_generated(path)
     if _run(path, ["diff", "--cached", "--quiet"], check=False).returncode == 0:
         return None
@@ -220,16 +291,26 @@ def has_upstream(repo: str | Path) -> bool:
 
 
 def sync_state(repo: str | Path) -> str:
-    """Inspect local/upstream divergence without contacting the remote."""
+    """Inspect local/upstream divergence without contacting or changing the repository."""
 
     try:
-        path = ensure_repository(repo)
-        if not has_remote(path):
+        raw = Path(repo)
+        if raw.is_symlink():
+            return "error"
+        path = raw.resolve()
+        if not path.is_dir() or not (path / ".git").exists():
+            return "error"
+        if not _run(path, ["remote"], check=False).stdout.strip():
             return "no-remote"
         if _run(path, ["status", "--porcelain"], check=False).stdout.strip():
             return "error"
-        if not has_upstream(path):
-            return "ahead" if repository_head(path) else "clean"
+        if _run(
+            path,
+            ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+            check=False,
+        ).returncode != 0:
+            head = _run(path, ["rev-parse", "HEAD"], check=False)
+            return "ahead" if head.returncode == 0 and head.stdout.strip() else "clean"
         result = _run(path, ["rev-list", "--left-right", "--count", "@{u}...HEAD"], check=False)
         if result.returncode != 0:
             return "error"
@@ -248,17 +329,55 @@ def sync_state(repo: str | Path) -> str:
         return "error"
 
 
-def pull_rebase(repo: str | Path) -> bool:
-    """Pull only when a configured remote and upstream exist, aborting failed rebases."""
+def _fetch_git_sync_basis(repo: Path, base_head: str) -> dict[str, Any]:
+    local_ref = _run(repo, ["symbolic-ref", "--quiet", "HEAD"], check=False).stdout.strip()
+    if not local_ref:
+        raise PreferenceGitError("cannot synchronize from a detached Git HEAD")
+    branch = local_ref.removeprefix("refs/heads/")
+    remote = _run(repo, ["config", "--get", f"branch.{branch}.remote"], check=False).stdout.strip()
+    upstream_ref = _run(
+        repo,
+        ["rev-parse", "--symbolic-full-name", "@{u}"],
+        check=False,
+    ).stdout.strip()
+    if not remote or not upstream_ref:
+        raise PreferenceGitError("configured upstream information is incomplete")
+    _run(repo, ["fetch", "--no-tags", remote], timeout=120)
+    return build_git_sync_basis(
+        repo,
+        local_ref=local_ref,
+        upstream_ref=upstream_ref,
+        base_head=base_head,
+    )
+
+
+def pull_rebase(
+    repo: str | Path,
+    *,
+    data_root: str | Path | None = None,
+    validate: Callable[[], Any] | None = None,
+) -> bool:
+    """Fetch a fixed upstream and rebase verified local commits onto it."""
 
     path = ensure_repository(repo)
     before = repository_head(path)
     if not has_remote(path) or not has_upstream(path):
         return False
-    transaction = begin_generated_transaction(path)
+    if before is None:
+        raise PreferenceGitError("cannot synchronize a preference repository without HEAD")
+    sync_basis = _fetch_git_sync_basis(path, before)
+    transaction = begin_generated_transaction(
+        path,
+        data_root=data_root,
+        kind="git_sync",
+        sync_basis=sync_basis,
+    )
     try:
-        _run(path, ["pull", "--rebase", "--autostash"], timeout=120)
-    except PreferenceGitError:
+        _run(path, ["rebase", sync_basis["upstream_oid"]], timeout=120)
+        if validate is not None:
+            validate()
+        complete_generated_transaction(transaction)
+    except Exception:
         _run(path, ["rebase", "--abort"], check=False, timeout=120)
         if repository_head(path) != transaction.head and transaction.head:
             _run(path, ["reset", "--hard", transaction.head], timeout=120)
@@ -289,7 +408,11 @@ def _commit_paths(repo: Path, commit: str) -> list[str]:
 
 
 def _managed_path(path: str) -> bool:
-    return path in {"groups.json", "version.json", "evidence"} or path.startswith("evidence/")
+    return (
+        path in {"groups.json", "version.json", "evidence", "changes"}
+        or path.startswith("evidence/")
+        or path.startswith("changes/")
+    )
 
 
 def _rollback_target(repo: Path, commit: str, subject: str) -> bool:
@@ -355,10 +478,13 @@ def _rollback(repo: str | Path, commit: str | None = None) -> str:
     # cannot be deleted by reverting an older generated commit.
     for name in ("evidence", "version.json"):
         _run(path, ["checkout", "HEAD", "--", name], check=False)
-    _run(path, ["add", "-A", "--", *GENERATED_PATHS])
+    _stage_generated(path)
     if _run(path, ["diff", "--cached", "--quiet"], check=False).returncode == 0:
         raise PreferenceGitError("rollback produced no generated-file changes")
     message = f'Revert "{subject or target}" [personal-preferences rollback: {target}]'
+    transaction = active_transaction_for(path / "groups.json")
+    if transaction is not None:
+        message = f"{message} {transaction.marker}"
     _run(path, ["commit", "--quiet", "-m", message], timeout=120)
     head = repository_head(path)
     if not head:
@@ -366,13 +492,20 @@ def _rollback(repo: str | Path, commit: str | None = None) -> str:
     return head
 
 
-def rollback(repo: str | Path, commit: str | None = None) -> str:
+def rollback(
+    repo: str | Path,
+    commit: str | None = None,
+    *,
+    data_root: str | Path | None = None,
+) -> str:
     path = ensure_repository(repo)
     if _run(path, ["status", "--porcelain"], check=False).stdout.strip():
         raise PreferenceGitError("cannot rollback with a dirty preference repository")
-    transaction = begin_generated_transaction(path)
+    transaction = begin_generated_transaction(path, data_root=data_root)
     try:
-        return _rollback(path, commit)
+        result = _rollback(path, commit)
+        complete_generated_transaction(transaction)
+        return result
     except Exception:
         _run(path, ["revert", "--abort"], check=False)
         restore_generated_transaction(transaction)

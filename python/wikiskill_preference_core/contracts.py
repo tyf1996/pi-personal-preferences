@@ -14,7 +14,13 @@ from typing import Any, Mapping
 from .errors import PreferenceContractError
 from .sanitizing import DEFAULT_DENIED_FILE_NAMES, path_is_denied
 
-SCHEMA_VERSION = 1
+GROUPS_SCHEMA_VERSION_V1 = 1
+GROUPS_SCHEMA_VERSION_V2 = 2
+ACTIVATIONS_SCHEMA_VERSION_V1 = 1
+ACTIVATIONS_SCHEMA_VERSION_V2 = 2
+EVENT_SCHEMA_VERSION_V1 = 1
+CLASSIFICATION_SCHEMA_VERSION_V1 = 1
+VERSION_SCHEMA_VERSION_V2 = 2
 
 
 class Signal(str, Enum):
@@ -115,6 +121,12 @@ def _integer(value: Any, label: str, *, minimum: int | None = None) -> int:
     return value
 
 
+def _boolean(value: Any, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise PreferenceContractError(f"{label} must be a boolean")
+    return value
+
+
 def _timestamp(value: Any, label: str) -> str:
     result = _string(value, label)
     try:
@@ -198,6 +210,85 @@ class PreferenceGroup:
 
 
 @dataclass(frozen=True)
+class PreferenceRuleV2:
+    id: str
+    revision: int
+    text: str
+    enabled: bool
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "PreferenceRuleV2":
+        data = _strict(
+            value,
+            {"id", "revision", "text", "enabled"},
+            {"id", "revision", "text", "enabled"},
+            "preference rule v2",
+        )
+        return cls(
+            _safe_id(data["id"], "rule.id"),
+            _integer(data["revision"], "rule.revision", minimum=1),
+            _string(data["text"], "rule.text", max_length=1000).strip(),
+            _boolean(data["enabled"], "rule.enabled"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "revision": self.revision,
+            "text": self.text,
+            "enabled": self.enabled,
+        }
+
+
+@dataclass(frozen=True)
+class PreferenceGroupV2:
+    id: str
+    revision: int
+    name: str
+    description: str
+    rules: list[PreferenceRuleV2]
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "PreferenceGroupV2":
+        data = _strict(
+            value,
+            {"id", "revision", "name", "description", "rules"},
+            {"id", "revision", "name", "description", "rules"},
+            "preference group v2",
+        )
+        if not isinstance(data["rules"], list):
+            raise PreferenceContractError("group.rules must be a list")
+        rules = [PreferenceRuleV2.from_dict(item) for item in data["rules"]]
+        if len({rule.id for rule in rules}) != len(rules):
+            raise PreferenceContractError("preference group contains duplicate rule IDs")
+        if len({rule.text for rule in rules}) != len(rules):
+            raise PreferenceContractError("preference group contains duplicate rule text")
+        return cls(
+            _safe_id(data["id"], "group.id"),
+            _integer(data["revision"], "group.revision", minimum=1),
+            _group_name(data["name"], "group.name"),
+            _string(data["description"], "group.description", max_length=2000).strip(),
+            rules,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "revision": self.revision,
+            "name": self.name,
+            "description": self.description,
+            "rules": [rule.to_dict() for rule in self.rules],
+        }
+
+    def legacy_view(self) -> PreferenceGroup:
+        return PreferenceGroup(
+            self.name,
+            self.description,
+            [rule.text for rule in self.rules if rule.enabled],
+        )
+
+
+@dataclass(frozen=True)
 class PreferenceGroupsDocument:
     schema_version: int
     groups: list[PreferenceGroup]
@@ -205,7 +296,7 @@ class PreferenceGroupsDocument:
     @classmethod
     def from_dict(cls, value: Any) -> "PreferenceGroupsDocument":
         data = _strict(value, {"schema_version", "groups"}, {"schema_version", "groups"}, "preference groups document")
-        if _integer(data["schema_version"], "groups.schema_version") != SCHEMA_VERSION:
+        if _integer(data["schema_version"], "groups.schema_version") != GROUPS_SCHEMA_VERSION_V1:
             raise PreferenceContractError("groups schema_version must be 1")
         raw_groups = data["groups"]
         if not isinstance(raw_groups, list):
@@ -213,7 +304,36 @@ class PreferenceGroupsDocument:
         groups = [PreferenceGroup.from_dict(item) for item in raw_groups]
         if len({group.name for group in groups}) != len(groups):
             raise PreferenceContractError("groups document contains duplicate group names")
-        return cls(SCHEMA_VERSION, groups)
+        return cls(GROUPS_SCHEMA_VERSION_V1, groups)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "groups": [group.to_dict() for group in self.groups],
+        }
+
+
+@dataclass(frozen=True)
+class PreferenceGroupsDocumentV2:
+    schema_version: int
+    groups: list[PreferenceGroupV2]
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "PreferenceGroupsDocumentV2":
+        data = _strict(value, {"schema_version", "groups"}, {"schema_version", "groups"}, "preference groups document v2")
+        if _integer(data["schema_version"], "groups.schema_version") != GROUPS_SCHEMA_VERSION_V2:
+            raise PreferenceContractError("groups schema_version must be 2")
+        if not isinstance(data["groups"], list):
+            raise PreferenceContractError("groups.groups must be a list")
+        groups = [PreferenceGroupV2.from_dict(item) for item in data["groups"]]
+        if len({group.id for group in groups}) != len(groups):
+            raise PreferenceContractError("groups document contains duplicate group IDs")
+        if len({group.name for group in groups}) != len(groups):
+            raise PreferenceContractError("groups document contains duplicate group names")
+        rule_ids = [rule.id for group in groups for rule in group.rules]
+        if len(rule_ids) != len(set(rule_ids)):
+            raise PreferenceContractError("groups document contains duplicate rule IDs")
+        return cls(GROUPS_SCHEMA_VERSION_V2, groups)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -223,11 +343,28 @@ class PreferenceGroupsDocument:
 
 
 def groups_document(groups: list[PreferenceGroup]) -> dict[str, Any]:
-    return PreferenceGroupsDocument(SCHEMA_VERSION, list(groups)).to_dict()
+    return PreferenceGroupsDocument(GROUPS_SCHEMA_VERSION_V1, list(groups)).to_dict()
+
+
+def groups_document_v2(groups: list[PreferenceGroupV2]) -> dict[str, Any]:
+    return PreferenceGroupsDocumentV2(GROUPS_SCHEMA_VERSION_V2, list(groups)).to_dict()
+
+
+def parse_groups_document_versioned(value: Any) -> PreferenceGroupsDocument | PreferenceGroupsDocumentV2:
+    data = _object(value, "preference groups document")
+    version = data.get("schema_version")
+    if version == GROUPS_SCHEMA_VERSION_V1:
+        return PreferenceGroupsDocument.from_dict(data)
+    if version == GROUPS_SCHEMA_VERSION_V2:
+        return PreferenceGroupsDocumentV2.from_dict(data)
+    raise PreferenceContractError(f"groups schema_version is unsupported: {version!r}")
 
 
 def parse_groups_document(value: Any) -> list[PreferenceGroup]:
-    return PreferenceGroupsDocument.from_dict(value).groups
+    document = parse_groups_document_versioned(value)
+    if isinstance(document, PreferenceGroupsDocumentV2):
+        return [group.legacy_view() for group in document.groups]
+    return document.groups
 
 
 @dataclass(frozen=True)
@@ -244,10 +381,10 @@ class GroupActivationDocument:
             {"schema_version", "directories", "sessions"},
             "group activation document",
         )
-        if _integer(data["schema_version"], "activations.schema_version") != SCHEMA_VERSION:
+        if _integer(data["schema_version"], "activations.schema_version") != ACTIVATIONS_SCHEMA_VERSION_V1:
             raise PreferenceContractError("activations schema_version must be 1")
         return cls(
-            SCHEMA_VERSION,
+            ACTIVATIONS_SCHEMA_VERSION_V1,
             _activation_map(data["directories"], "activations.directories"),
             _activation_map(data["sessions"], "activations.sessions"),
         )
@@ -277,15 +414,82 @@ def _activation_map(value: Any, label: str) -> dict[str, list[str]]:
     return result
 
 
+@dataclass(frozen=True)
+class GroupActivationDocumentV2:
+    schema_version: int
+    directories: dict[str, list[str]]
+    sessions: dict[str, list[str]]
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "GroupActivationDocumentV2":
+        data = _strict(
+            value,
+            {"schema_version", "directories", "sessions"},
+            {"schema_version", "directories", "sessions"},
+            "group activation document v2",
+        )
+        if _integer(data["schema_version"], "activations.schema_version") != ACTIVATIONS_SCHEMA_VERSION_V2:
+            raise PreferenceContractError("activations schema_version must be 2")
+        return cls(
+            ACTIVATIONS_SCHEMA_VERSION_V2,
+            _activation_id_map(data["directories"], "activations.directories"),
+            _activation_id_map(data["sessions"], "activations.sessions"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "directories": {key: list(value) for key, value in self.directories.items()},
+            "sessions": {key: list(value) for key, value in self.sessions.items()},
+        }
+
+
+def _activation_id_map(value: Any, label: str) -> dict[str, list[str]]:
+    data = _object(value, label)
+    result: dict[str, list[str]] = {}
+    for key, groups in data.items():
+        if not isinstance(key, str) or not key.strip():
+            raise PreferenceContractError(f"{label} keys must be non-empty strings")
+        if not isinstance(groups, list):
+            raise PreferenceContractError(f"{label}[{key!r}] must be a list")
+        normalized: list[str] = []
+        for index, group in enumerate(groups):
+            group_id = _safe_id(group, f"{label}[{key!r}][{index}]")
+            if group_id not in normalized:
+                normalized.append(group_id)
+        result[key] = normalized
+    return result
+
+
 def activations_document(
     directories: dict[str, list[str]],
     sessions: dict[str, list[str]],
 ) -> dict[str, Any]:
-    return GroupActivationDocument(SCHEMA_VERSION, directories, sessions).to_dict()
+    return GroupActivationDocument(ACTIVATIONS_SCHEMA_VERSION_V1, directories, sessions).to_dict()
+
+
+def activations_document_v2(
+    directories: dict[str, list[str]],
+    sessions: dict[str, list[str]],
+) -> dict[str, Any]:
+    return GroupActivationDocumentV2(ACTIVATIONS_SCHEMA_VERSION_V2, directories, sessions).to_dict()
+
+
+def parse_activations_document_versioned(value: Any) -> GroupActivationDocument | GroupActivationDocumentV2:
+    data = _object(value, "group activation document")
+    version = data.get("schema_version")
+    if version == ACTIVATIONS_SCHEMA_VERSION_V1:
+        return GroupActivationDocument.from_dict(data)
+    if version == ACTIVATIONS_SCHEMA_VERSION_V2:
+        return GroupActivationDocumentV2.from_dict(data)
+    raise PreferenceContractError(f"activations schema_version is unsupported: {version!r}")
 
 
 def parse_activations_document(value: Any) -> GroupActivationDocument:
-    return GroupActivationDocument.from_dict(value)
+    document = parse_activations_document_versioned(value)
+    if isinstance(document, GroupActivationDocumentV2):
+        raise PreferenceContractError("v2 activations require group ID resolution")
+    return document
 
 
 @dataclass(frozen=True)
@@ -304,7 +508,7 @@ class GroupClassificationRequest:
             {"schema_version", "preference_text", "task_summary", "touched_paths", "groups"},
             "group classification request",
         )
-        if _integer(data["schema_version"], "classification.schema_version") != SCHEMA_VERSION:
+        if _integer(data["schema_version"], "classification.schema_version") != CLASSIFICATION_SCHEMA_VERSION_V1:
             raise PreferenceContractError("group classification schema_version must be 1")
         raw_groups = data["groups"]
         if not isinstance(raw_groups, list) or not raw_groups:
@@ -330,7 +534,7 @@ class GroupClassificationRequest:
             raise PreferenceContractError("classification.groups must contain unique names")
         touched_paths = _paths(data["touched_paths"], "classification.touched_paths")
         return cls(
-            SCHEMA_VERSION,
+            CLASSIFICATION_SCHEMA_VERSION_V1,
             _string(data["preference_text"], "classification.preference_text", max_length=2000).strip(),
             _string(data["task_summary"], "classification.task_summary", non_empty=False, max_length=1000).strip(),
             touched_paths,
@@ -399,10 +603,10 @@ class PreferenceEvent:
             allowed,
             "preference event",
         )
-        if _integer(data["schema_version"], "event.schema_version") != SCHEMA_VERSION:
+        if _integer(data["schema_version"], "event.schema_version") != EVENT_SCHEMA_VERSION_V1:
             raise PreferenceContractError("preference event schema_version must be 1")
         return cls(
-            SCHEMA_VERSION,
+            EVENT_SCHEMA_VERSION_V1,
             _safe_id(data["id"], "event.id"),
             _timestamp(data["created_at"], "event.created_at"),
             _group_name(data["group"], "event.group"),
