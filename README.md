@@ -257,4 +257,4 @@ local/metrics.jsonl                            # 受限本机指标
 
 同步不会上传 snapshot、绝对路径、凭据、consent、worker lease、事务记录或本机 activation。Git rebase 后会重新校验证据 DAG；未知 JSONL/旧格式、缺父、环、自引、重复 parent、extractor restore、withdraw 后直接 upsert、同 revision ID 不同内容或路径 symlink 会停止同步和写入，不静默覆盖用户数据。push 失败时，本地成功 commit 会保留，`/pref` 会显示 push 错误和当前 sync state。未知费用保持 `cost_status=unknown`；当前只验证 fake/loopback/临时 bare remote，不声称真实 provider 计费、OAuth 刷新、托管远端或真实网络文件系统已验证。
 
-自动化验证使用临时目录：独立扩展子树运行 `npm ci`、包内 `npm run check` 和 `npm pack`；`test/install-smoke.test.ts` 在临时 agentDir 中真实执行 `pi install` 后完成官方 RPC loader smoke。验证不读取真实用户凭据或偏好数据。实际部署还需核对本机数据切换、提供商行为和私有同步仓库；支持的锁实现为 POSIX `fcntl`，未验证网络文件系统并发或真实断电。
+内部 CLI 会在取得 data-root 写锁前完成 `--stdin` 的 4 MiB 有界读取与 JSON 解析，随后复用同一解析对象；等待调用方 EOF、输出传输和模型网络 I/O 不占用该写锁。自动化验证使用临时目录：独立扩展子树运行 `npm ci`、包内 `npm run check` 和 `npm pack`；`test/install-smoke.test.ts` 在临时 agentDir 中真实执行 `pi install` 后完成官方 RPC loader smoke。验证不读取真实用户凭据或偏好数据。实际部署还需核对本机数据切换、提供商行为和私有同步仓库；支持的锁实现为 POSIX `fcntl`，未验证网络文件系统并发或真实断电。

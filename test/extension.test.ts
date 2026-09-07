@@ -36,11 +36,36 @@ function setConfig(root: string, update: (config: any) => void): void {
 }
 
 let v2RequestCounter = 0;
+function boundedProcessText(value: unknown): string {
+  const text = Buffer.isBuffer(value) ? value.toString("utf8") : typeof value === "string" ? value : "";
+  return text.trim().slice(0, 2_000);
+}
+
 function runV2(root: string, command: string, action: string, expectedGeneration: number | null, payload: Record<string, unknown>): any {
-  return JSON.parse(execFileSync("python3", [CLI, command, "--stdin", "--data-root", root], {
-    input: JSON.stringify({ schema_version: 2, request_id: `test-${++v2RequestCounter}`, action, expected_generation: expectedGeneration, payload }),
-    encoding: "utf8",
-  }));
+  const requestId = `test-${++v2RequestCounter}`;
+  try {
+    return JSON.parse(execFileSync("python3", [CLI, command, "--stdin", "--data-root", root], {
+      input: JSON.stringify({ schema_version: 2, request_id: requestId, action, expected_generation: expectedGeneration, payload }),
+      encoding: "utf8",
+    }));
+  } catch (error) {
+    const failure = error as { status?: unknown; stdout?: unknown; stderr?: unknown };
+    const stdout = boundedProcessText(failure.stdout);
+    const stderr = boundedProcessText(failure.stderr);
+    let errorCode = "unavailable";
+    let errorMessage = "";
+    try {
+      const envelope = JSON.parse(stdout) as { error?: { code?: unknown; message?: unknown } };
+      if (typeof envelope.error?.code === "string") errorCode = envelope.error.code;
+      if (typeof envelope.error?.message === "string") errorMessage = envelope.error.message.slice(0, 500);
+    } catch { /* Preserve bounded raw stdout below. */ }
+    throw new Error([
+      `runV2 ${command}/${action} failed: status=${String(failure.status ?? "unknown")} error_code=${errorCode}`,
+      errorMessage ? `error_message=${errorMessage}` : "",
+      stdout ? `stdout=${stdout}` : "stdout=(empty)",
+      stderr ? `stderr=${stderr}` : "stderr=(empty)",
+    ].filter(Boolean).join("\n"), { cause: error });
+  }
 }
 
 function authorizeFeedback(root: string, feedback: string, snapshot: Record<string, unknown>, selection: Record<string, unknown>, revision: number): any {
@@ -305,6 +330,19 @@ test("latest CLI init, groups, remember and status are isolated to a temporary r
     assert.equal(typeof status.pending_feedback_count, "number");
     assert.equal("auto_evolve" in JSON.parse(readFileSync(join(root, "config.json"), "utf8")), false);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("runV2 preserves bounded structured CLI failure diagnostics", () => {
+  const root = tempRoot();
+  try {
+    init(root);
+    assert.throws(
+      () => runV2(root, "evidence", "get", null, {}),
+      /evidence\/get failed: status=2 error_code=invalid_request[\s\S]*evidence get requires evidence_id[\s\S]*stderr=\(empty\)/u,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("footer keeps the dim first-line right summary and preserves location when narrow", () => {

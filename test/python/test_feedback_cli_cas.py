@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -13,6 +16,86 @@ from wikiskill_preference_core.store import PreferenceStore
 
 
 class FeedbackCliCasTest(unittest.TestCase):
+    def test_partial_stdin_never_holds_the_data_root_lock_or_blocks_a_complete_query(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            PreferenceStore.init(root)
+            blocker = subprocess.Popen(
+                [sys.executable, str(_support.CLI), "evidence", "--stdin", "--data-root", str(root)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            assert blocker.stdin is not None
+            blocker.stdin.write('{"schema_version":2')
+            blocker.stdin.flush()
+
+            lock_path = root / "local" / "data.lock"
+            held_before_eof = False
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+                try:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    except BlockingIOError:
+                        held_before_eof = True
+                        break
+                finally:
+                    os.close(descriptor)
+                time.sleep(0.025)
+
+            query = _support.request("complete-query", "list", payload={})
+            probe = subprocess.Popen(
+                [sys.executable, str(_support.CLI), "evidence", "--stdin", "--data-root", str(root)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            query_blocked = False
+            try:
+                probe_stdout, probe_stderr = probe.communicate(json.dumps(query), timeout=1.0)
+            except subprocess.TimeoutExpired:
+                query_blocked = True
+                probe_stdout = probe_stderr = ""
+            finally:
+                blocker.stdin.close()
+                blocker.wait(timeout=5)
+                if query_blocked:
+                    probe_stdout, probe_stderr = probe.communicate(timeout=5)
+                if blocker.stdout is not None:
+                    blocker.stdout.close()
+                if blocker.stderr is not None:
+                    blocker.stderr.close()
+
+            self.assertFalse(held_before_eof, "CLI acquired the data-root lock before stdin EOF")
+            self.assertFalse(query_blocked, "complete evidence query waited on a partial-stdin caller")
+            self.assertEqual(probe.returncode, 0, probe_stdout or probe_stderr)
+            self.assertTrue(json.loads(probe_stdout)["ok"])
+
+    def test_oversized_stdin_fails_bounded_and_leaves_the_root_queryable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            PreferenceStore.init(root)
+            oversized = '{"request_id":"oversized","padding":"' + ("x" * (4 * 1024 * 1024)) + '"}'
+            result = subprocess.run(
+                [sys.executable, str(_support.CLI), "evidence", "--stdin", "--data-root", str(root)],
+                input=oversized,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            envelope = json.loads(result.stdout)
+            self.assertEqual(envelope["error"]["code"], "preference_error")
+            self.assertIn("stdin exceeded 4 MiB", envelope["error"]["message"])
+            listed = _support.run_cli(root, ["evidence", "--stdin"], _support.request("after-oversized", "list", payload={}))
+            self.assertTrue(listed["ok"])
+
     def test_concurrent_update_has_one_cas_winner_and_one_stale_writer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); PreferenceStore.init(root)

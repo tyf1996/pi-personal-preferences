@@ -79,6 +79,9 @@ from wikiskill_preference_core.transactions import (  # noqa: E402
 )
 
 
+MAX_STDIN_BYTES = 4 * 1024 * 1024
+_V2_COMMANDS = {"feedback", "learning-job", "model-call", "evidence", "proposal", "proposal-job", "history", "settings"}
+
 
 def default_data_root() -> Path:
     override = os.environ.get("PI_PREFERENCE_DATA_ROOT")
@@ -88,11 +91,27 @@ def default_data_root() -> Path:
     return (agent_dir / "personal-preferences").resolve()
 
 
-def _json_input() -> Any:
+def _stdin_text(*, line: bool) -> str:
     try:
-        text = sys.stdin.read()
+        binary = getattr(sys.stdin, "buffer", None)
+        if binary is not None:
+            payload = binary.readline(MAX_STDIN_BYTES + 1) if line else binary.read(MAX_STDIN_BYTES + 1)
+            if len(payload) > MAX_STDIN_BYTES:
+                raise PreferenceError("stdin exceeded 4 MiB")
+            try:
+                return payload.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise PreferenceError("stdin is not valid UTF-8") from exc
+        text = sys.stdin.readline(MAX_STDIN_BYTES + 1) if line else sys.stdin.read(MAX_STDIN_BYTES + 1)
     except OSError as exc:
         raise PreferenceError(f"cannot read stdin: {exc}") from exc
+    if len(text.encode("utf-8")) > MAX_STDIN_BYTES:
+        raise PreferenceError("stdin exceeded 4 MiB")
+    return text
+
+
+def _json_input() -> dict[str, Any]:
+    text = _stdin_text(line=False)
     if not text.strip():
         raise PreferenceError("stdin must contain a JSON object")
     try:
@@ -105,10 +124,7 @@ def _json_input() -> Any:
 
 
 def _json_line_input() -> dict[str, Any]:
-    try:
-        text = sys.stdin.readline()
-    except OSError as exc:
-        raise PreferenceError(f"cannot read stdin: {exc}") from exc
+    text = _stdin_text(line=True)
     if not text.strip():
         raise PreferenceError("stdin must contain a JSON object line")
     try:
@@ -117,6 +133,27 @@ def _json_line_input() -> dict[str, Any]:
         raise PreferenceError(f"stdin line is not valid JSON: {exc}") from exc
     if not isinstance(value, dict):
         raise PreferenceError("stdin JSON line must be an object")
+    return value
+
+
+def _prepare_stdin(args: argparse.Namespace) -> None:
+    # Finish bounded caller-owned input before dispatch can acquire the root lock.
+    if not getattr(args, "stdin", False) or (args.command == "rollback" and args.preview):
+        return
+    value = _json_line_input() if args.command == "classify-group" and args.pi_model else _json_input()
+    args.stdin_value = value
+    if args.command in _V2_COMMANDS:
+        request_id = value.get("request_id")
+        if args.command == "settings":
+            args.v2_request_id = request_id if isinstance(request_id, str) else "invalid-request"
+        else:
+            args.v2_request_id = request_id if isinstance(request_id, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", request_id) else "invalid-request"
+
+
+def _prepared_stdin(args: argparse.Namespace) -> dict[str, Any]:
+    value = getattr(args, "stdin_value", None)
+    if not isinstance(value, dict):
+        raise PreferenceError("stdin request was not prepared")
     return value
 
 
@@ -596,8 +633,7 @@ def _settings_update(store: PreferenceStore, payload: Any, expected_generation: 
     return _settings_get(PreferenceStore(store.root))
 
 
-def _settings_v2_command(args: argparse.Namespace) -> dict[str, Any]:
-    raw = _json_input()
+def _settings_v2_command(args: argparse.Namespace, raw: dict[str, Any]) -> dict[str, Any]:
     request_id = raw.get("request_id") if isinstance(raw, dict) else None
     args.v2_request_id = request_id if isinstance(request_id, str) else "invalid-request"
     request = CommandRequest.from_dict(raw)
@@ -805,8 +841,7 @@ def _model_call(store: PreferenceStore, payload: Any) -> tuple[dict[str, Any], d
     return {"output": output, "usage": usage}, cas_for("model-call", 0, {"model": configured["name"]}).to_dict()
 
 
-def _evidence_v2_command(args: argparse.Namespace) -> dict[str, Any]:
-    raw = _json_input()
+def _evidence_v2_command(args: argparse.Namespace, raw: dict[str, Any]) -> dict[str, Any]:
     request_id = raw.get("request_id")
     args.v2_request_id = request_id if isinstance(request_id, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", request_id) else "invalid-request"
     request = CommandRequest.from_dict(raw)
@@ -844,8 +879,7 @@ def _evidence_v2_command(args: argparse.Namespace) -> dict[str, Any]:
     return success_envelope(request.request_id, data, cas=CasState.from_dict(cas))
 
 
-def _proposal_v2_command(args: argparse.Namespace) -> dict[str, Any]:
-    raw = _json_input()
+def _proposal_v2_command(args: argparse.Namespace, raw: dict[str, Any]) -> dict[str, Any]:
     request_id = raw.get("request_id")
     args.v2_request_id = request_id if isinstance(request_id, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", request_id) else "invalid-request"
     request = CommandRequest.from_dict(raw)
@@ -899,8 +933,7 @@ def _proposal_v2_command(args: argparse.Namespace) -> dict[str, Any]:
     return success_envelope(request.request_id, data, cas=CasState.from_dict(cas))
 
 
-def _history_v2_command(args: argparse.Namespace) -> dict[str, Any]:
-    raw = _json_input()
+def _history_v2_command(args: argparse.Namespace, raw: dict[str, Any]) -> dict[str, Any]:
     request = CommandRequest.from_dict(raw)
     args.v2_request_id = request.request_id
     if request.expected_generation is not None:
@@ -920,8 +953,7 @@ def _history_v2_command(args: argparse.Namespace) -> dict[str, Any]:
     return success_envelope(request.request_id, data, cas=cas_for("history", len(operations), operations))
 
 
-def _learning_v2_command(args: argparse.Namespace) -> dict[str, Any]:
-    raw = _json_input()
+def _learning_v2_command(args: argparse.Namespace, raw: dict[str, Any]) -> dict[str, Any]:
     request_id = raw.get("request_id")
     args.v2_request_id = request_id if isinstance(request_id, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", request_id) else "invalid-request"
     request = CommandRequest.from_dict(raw)
@@ -1053,7 +1085,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                     return dispatch(args)
                 finally:
                     args.data_root_locked = False
-        return _settings_v2_command(args)
+        return _settings_v2_command(args, _prepared_stdin(args))
     if args.command in {"proposal", "proposal-job"}:
         if not getattr(args, "data_root_locked", False):
             with data_root_lock(args.data_root):
@@ -1063,7 +1095,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                     return dispatch(args)
                 finally:
                     args.data_root_locked = False
-        return _proposal_v2_command(args)
+        return _proposal_v2_command(args, _prepared_stdin(args))
     if args.command == "history":
         if not getattr(args, "data_root_locked", False):
             with data_root_lock(args.data_root):
@@ -1073,7 +1105,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                     return dispatch(args)
                 finally:
                     args.data_root_locked = False
-        return _history_v2_command(args)
+        return _history_v2_command(args, _prepared_stdin(args))
     if args.command == "evidence":
         if not getattr(args, "data_root_locked", False):
             with data_root_lock(args.data_root):
@@ -1083,9 +1115,9 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                     return dispatch(args)
                 finally:
                     args.data_root_locked = False
-        return _evidence_v2_command(args)
+        return _evidence_v2_command(args, _prepared_stdin(args))
     if args.command == "model-call":
-        return _learning_v2_command(args)
+        return _learning_v2_command(args, _prepared_stdin(args))
     if args.command in {"feedback", "learning-job"}:
         if not getattr(args, "data_root_locked", False):
             with data_root_lock(args.data_root):
@@ -1095,7 +1127,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                     return dispatch(args)
                 finally:
                     args.data_root_locked = False
-        return _learning_v2_command(args)
+        return _learning_v2_command(args, _prepared_stdin(args))
     if args.command == "init":
         store = PreferenceStore.init(args.data_root)
         commit = initialize_commit(store.repo) or repository_head(store.repo)
@@ -1123,18 +1155,17 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "groups":
         return _groups_output(store)
     if args.command == "manage-group":
-        return _manage_group(store, _json_input())
+        return _manage_group(store, _prepared_stdin(args))
     if args.command == "set-activation":
-        return _set_activation(store, _json_input())
+        return _set_activation(store, _prepared_stdin(args))
     if args.command == "context":
-        return _context(store, _json_input())
+        return _context(store, _prepared_stdin(args))
     if args.command == "remember":
-        return _remember(store, _json_input())
+        return _remember(store, _prepared_stdin(args))
     if args.command == "classify-group":
         if args.pi_model and store.config.provider["name"] != "pi":
             raise PreferenceError("--pi-model requires provider.name=pi")
-        reader = _json_line_input if args.pi_model else _json_input
-        return _classify_group(store, reader(), _pi_model_response if args.pi_model else None)
+        return _classify_group(store, _prepared_stdin(args), _pi_model_response if args.pi_model else None)
     if args.command == "status":
         return _status(store)
     if args.command == "sync":
@@ -1146,7 +1177,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
             return {"ok": True, **rollback_preview(store.root)}
         if not args.stdin:
             raise PreferenceError("rollback confirmation requires --stdin with expected operation and HEAD")
-        result = apply_rollback(store.root, _json_input())
+        result = apply_rollback(store.root, _prepared_stdin(args))
         push_result = _push_result(store, requested=store.config.git_auto_push)
         return {"ok": True, **result, **push_result, "sync_state": sync_state(store.repo)}
     raise PreferenceError(f"unknown command: {args.command}")
@@ -1155,6 +1186,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        _prepare_stdin(args)
         result = dispatch(args)
     except PreferenceError as exc:
         message = sanitize_text(str(exc)).text[:500]
