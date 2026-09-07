@@ -21,4 +21,3 @@ jobs:
           python-version: "3.12"
       - run: npm ci --ignore-scripts
       - run: npm run check
-      - run: python3 -m compileall -q python

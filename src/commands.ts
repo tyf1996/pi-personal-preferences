@@ -75,7 +75,7 @@ export function parsePrefCommand(input: string): PrefCommand {
       throw new Error("feedback expects good or fix");
     }
     const reason = options.rest.join(" ").trim() || undefined;
-    if (sentimentToken === "fix" && !reason) throw new Error("feedback fix requires a reason");
+    if (!reason) throw new Error(`feedback ${sentimentToken} requires a reason`);
     return {
       action,
       ...(options.group === undefined ? {} : { group: options.group }),

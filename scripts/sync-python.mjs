@@ -45,7 +45,8 @@ async function verifyStandaloneTarget() {
   for (const required of [
     "wikiskill_preference.py",
     "wikiskill_preference_core/__init__.py",
-    "wikiskill_preference_core/store.py",
+    "wikiskill_preference_core/storage.py",
+    "wikiskill_preference_core/git_sync.py",
   ]) {
     if (!targetFiles.includes(required)) throw new Error(`packaged Python runtime is incomplete: ${required}`);
   }

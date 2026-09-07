@@ -1,33 +1,31 @@
-import { createHash } from "node:crypto";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Key, matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
-export interface FeedbackTarget {
-  taskKey: string;
-  userEntryId: string;
-  assistantEntryId: string;
-  userText: string;
-  assistantText: string;
+export interface ConversationTurn {
+  user: string;
+  assistant: string;
 }
 
-export interface FeedbackSnapshot {
-  session_id: string;
-  task_key: string;
-  user_entry_id: string;
-  assistant_entry_id: string;
-  user_text: string;
-  assistant_text: string;
-  origin_verified: true;
-  storage_mode: "local_only" | "ask";
-}
+type Entry = { type?: unknown; message?: unknown };
 
-type Entry = { id?: unknown; type?: unknown; customType?: unknown; data?: unknown; message?: unknown };
+const SECRET_PATTERNS: Array<[RegExp, string]> = [
+  [/-----BEGIN [\s\S]*?PRIVATE KEY-----[\s\S]*?-----END [\s\S]*?PRIVATE KEY-----/giu, "[REDACTED_PRIVATE_KEY]"],
+  [/\b(?:sk|gh[pousr])_[A-Za-z0-9_-]{12,}\b/gu, "[REDACTED_CREDENTIAL]"],
+  [/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/gu, "[REDACTED_CREDENTIAL]"],
+  [/\b(?:api[_-]?key|access[_-]?token|password|authorization)\b\s*[:=]\s*\S+/giu, "[REDACTED_CREDENTIAL]"],
+];
 
 function clean(value: string): string {
-  return value.replace(/-----BEGIN [\s\S]*?PRIVATE KEY-----[\s\S]*?-----END [\s\S]*?PRIVATE KEY-----/gi, "[REDACTED_PRIVATE_KEY]")
-    .replace(/\b(?:sk|gh[pousr])_[A-Za-z0-9_-]{12,}\b/g, "[REDACTED_CREDENTIAL]")
-    .replace(/\b(?:api[_-]?key|access[_-]?token|password)\b\s*[:=]\s*\S+/gi, "[REDACTED_CREDENTIAL]")
-    .replace(/(?<![\w.:/-])\/(?:[^/\s]+\/)+[^/\s]+/g, "[REDACTED_PATH]")
-    .replace(/\s+/g, " ").trim().slice(0, 4000);
+  let result = value.replace(/\u0000/gu, "");
+  for (const [pattern, replacement] of SECRET_PATTERNS) result = result.replace(pattern, replacement);
+  return result.trim();
+}
+
+function role(entry: Entry): string | undefined {
+  const message = entry.message;
+  return message && typeof message === "object" && typeof (message as { role?: unknown }).role === "string"
+    ? (message as { role: string }).role
+    : undefined;
 }
 
 function visibleText(message: unknown): string | undefined {
@@ -35,206 +33,99 @@ function visibleText(message: unknown): string | undefined {
   const content = (message as { content?: unknown }).content;
   if (typeof content === "string") return clean(content) || undefined;
   if (!Array.isArray(content)) return undefined;
-  // Pi text blocks are user-visible. Thinking, tool calls/results, images, and
-  // all other block types are intentionally excluded at the trust boundary.
-  const text = content.filter((part): part is { type: "text"; text: string } => Boolean(part)
-    && typeof part === "object" && (part as { type?: unknown }).type === "text"
-    && typeof (part as { text?: unknown }).text === "string")
-    .map((part) => part.text).join("\n");
+  const text = content
+    .filter((part): part is { type: "text"; text: string } => Boolean(part)
+      && typeof part === "object"
+      && (part as { type?: unknown }).type === "text"
+      && typeof (part as { text?: unknown }).text === "string")
+    .map((part) => part.text)
+    .join("\n");
   return clean(text) || undefined;
 }
 
-function messageRole(entry: Entry): string | undefined {
-  const message = entry.message;
-  return message && typeof message === "object" && typeof (message as { role?: unknown }).role === "string"
-    ? (message as { role: string }).role : undefined;
-}
+/** Project only real messages from SessionManager's current branch. */
+export function recentConversationTurns(ctx: Pick<ExtensionContext, "sessionManager">): ConversationTurn[] {
+  const branch = ctx.sessionManager.getBranch() as Entry[];
+  const turns: ConversationTurn[] = [];
+  let users: string[] = [];
+  let assistants: string[] = [];
 
-function assistantStopReason(entry: Entry): unknown {
-  if (messageRole(entry) !== "assistant") return undefined;
-  return (entry.message as { stopReason?: unknown } | undefined)?.stopReason;
-}
-
-function assistantEndsTask(entry: Entry): boolean {
-  return ["stop", "length", "error", "aborted"].includes(String(assistantStopReason(entry)));
-}
-
-function assistantTerminal(entry: Entry): boolean {
-  return assistantStopReason(entry) === "stop";
-}
-
-function assistantCompleted(entry: Entry): boolean {
-  return assistantTerminal(entry) && Boolean(visibleText(entry.message));
-}
-
-function sourceKey(userEntryId: string, assistantEntryId: string): string {
-  return `feedback-task-${createHash("sha256").update(`${userEntryId}:${assistantEntryId}`).digest("hex").slice(0, 24)}`;
-}
-
-function sourcePair(userEntryId: string, assistantEntryId: string): string {
-  return `${userEntryId}:${assistantEntryId}`;
-}
-
-function validMarker(value: unknown): { task_key: string; user_entry_id: string; assistant_entry_id: string } | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const data = value as Record<string, unknown>;
-  if (data.schema_version !== 2 || typeof data.task_key !== "string" || !/^feedback-task-[0-9a-f]{24}$/u.test(data.task_key)
-      || typeof data.user_entry_id !== "string" || !data.user_entry_id
-      || typeof data.assistant_entry_id !== "string" || !data.assistant_entry_id) return undefined;
-  return { task_key: data.task_key, user_entry_id: data.user_entry_id, assistant_entry_id: data.assistant_entry_id };
-}
-
-/**
- * Uses only SessionManager's active branch APIs. Real user/final-assistant
- * messages are the source; body-free markers only preserve identity and dedupe.
- * Summaries and unrelated branches cannot substitute source text.
- */
-export class FeedbackContext {
-  private targets = new Map<string, FeedbackTarget>();
-
-  private branch(ctx: ExtensionContext): Entry[] {
-    const manager = ctx.sessionManager as unknown as { getLeafId?: () => string | null; getBranch?: (fromId?: string) => unknown[] };
-    if (typeof manager.getLeafId !== "function" || typeof manager.getBranch !== "function") return [];
-    const leaf = manager.getLeafId();
-    return manager.getBranch(leaf ?? undefined) as Entry[];
-  }
-
-  private targetsFromBranch(ctx: ExtensionContext): FeedbackTarget[] {
-    const branch = this.branch(ctx);
-    const parsed: FeedbackTarget[] = [];
-    let taskStart = 0;
-
-    for (let assistantIndex = 0; assistantIndex < branch.length; assistantIndex += 1) {
-      const assistant = branch[assistantIndex];
-      if (!assistantEndsTask(assistant)) continue;
-      let userIndex = -1;
-      for (let index = taskStart; index < assistantIndex; index += 1) {
-        const entry = branch[index];
-        if (messageRole(entry) === "user" && typeof entry.id === "string" && visibleText(entry.message)) {
-          userIndex = index;
-          break;
-        }
-      }
-      const user = branch[userIndex];
-      if (user && typeof user.id === "string" && typeof assistant.id === "string" && assistantCompleted(assistant)) {
-        const userText = branch.slice(userIndex, assistantIndex)
-          .filter((entry) => messageRole(entry) === "user")
-          .map((entry) => visibleText(entry.message))
-          .filter((text): text is string => Boolean(text))
-          .join("\n");
-        const assistantText = visibleText(assistant.message);
-        if (userText && assistantText) {
-          parsed.push({
-            taskKey: sourceKey(user.id, assistant.id),
-            userEntryId: user.id,
-            assistantEntryId: assistant.id,
-            userText,
-            assistantText,
-          });
-        }
-      }
-      taskStart = assistantIndex + 1;
+  for (const entry of branch) {
+    if (entry.type !== "message") continue;
+    const messageRole = role(entry);
+    if (messageRole === "user") {
+      const text = visibleText(entry.message);
+      if (text) users.push(text);
+      continue;
     }
-
-    const parsedPairs = new Set(parsed.map((target) => sourcePair(target.userEntryId, target.assistantEntryId)));
-    const markerKeys = new Map<string, string>();
-    for (const entry of branch) {
-      if (entry.type !== "custom" || entry.customType !== "personal-preferences-feedback-target") continue;
-      const marker = validMarker(entry.data);
-      if (!marker) continue;
-      const pair = sourcePair(marker.user_entry_id, marker.assistant_entry_id);
-      if (parsedPairs.has(pair) && !markerKeys.has(pair)) {
-        markerKeys.set(pair, marker.task_key);
-      }
+    if (messageRole !== "assistant" || users.length === 0) continue;
+    const text = visibleText(entry.message);
+    if (text) assistants.push(text);
+    const stopReason = (entry.message as { stopReason?: unknown }).stopReason;
+    if (stopReason === "toolUse" || stopReason === "pending" || stopReason === undefined) continue;
+    if (stopReason === "stop" && assistants.length) {
+      turns.push({ user: users.join("\n\n"), assistant: assistants.join("\n\n") });
     }
-
-    const manager = ctx.sessionManager as unknown as { getChildren?: (parentId: string) => unknown[] };
-    if (typeof manager.getChildren === "function") {
-      const traversableMetadata = new Set(["custom", "label", "session_info", "model_change", "thinking_level_change"]);
-      for (const target of parsed) {
-        const pair = sourcePair(target.userEntryId, target.assistantEntryId);
-        if (markerKeys.has(pair)) continue;
-        const pending = [...manager.getChildren(target.assistantEntryId)] as Entry[];
-        const visited = new Set<string>();
-        while (pending.length && visited.size < 64) {
-          const entry = pending.shift()!;
-          if (typeof entry.id !== "string" || visited.has(entry.id)) continue;
-          visited.add(entry.id);
-          if (entry.type === "custom" && entry.customType === "personal-preferences-feedback-target") {
-            const marker = validMarker(entry.data);
-            if (marker && sourcePair(marker.user_entry_id, marker.assistant_entry_id) === pair) {
-              markerKeys.set(pair, marker.task_key);
-              break;
-            }
-          }
-          if (!traversableMetadata.has(String(entry.type))) continue;
-          pending.push(...manager.getChildren(entry.id) as Entry[]);
-        }
-      }
-    }
-
-    const cachedKeys = new Map<string, string>();
-    for (const target of this.targets.values()) {
-      cachedKeys.set(sourcePair(target.userEntryId, target.assistantEntryId), target.taskKey);
-    }
-    const usedKeys = new Set<string>();
-    return parsed.map((target) => {
-      const pair = sourcePair(target.userEntryId, target.assistantEntryId);
-      const preferredKey = markerKeys.get(pair) ?? cachedKeys.get(pair) ?? target.taskKey;
-      const taskKey = usedKeys.has(preferredKey) ? target.taskKey : preferredKey;
-      usedKeys.add(taskKey);
-      return { ...target, taskKey };
-    });
+    users = [];
+    assistants = [];
   }
 
-  restore(ctx: ExtensionContext): FeedbackTarget[] {
-    this.targets.clear();
-    return this.available(ctx);
-  }
+  return turns.slice(-10);
+}
 
-  markSettled(ctx: ExtensionContext, appendMarker: (data: Record<string, unknown>) => void): FeedbackTarget | undefined {
-    const branch = this.branch(ctx);
-    const target = this.targetsFromBranch(ctx).at(-1);
-    if (!target) return undefined;
-    this.targets.set(target.taskKey, target);
-    const alreadyMarked = branch.some((entry) => {
-      if (entry.type !== "custom" || entry.customType !== "personal-preferences-feedback-target") return false;
-      const marker = validMarker(entry.data);
-      return marker?.task_key === target.taskKey
-        && marker.user_entry_id === target.userEntryId
-        && marker.assistant_entry_id === target.assistantEntryId;
-    });
-    if (alreadyMarked) return target;
-    // Marker contains only immutable entry references. No user/assistant body
-    // is persisted here; data is re-projected from the active branch on reload.
-    appendMarker({
-      schema_version: 2,
-      task_key: target.taskKey,
-      user_entry_id: target.userEntryId,
-      assistant_entry_id: target.assistantEntryId,
-    });
-    return target;
-  }
+function preview(value: string): string {
+  return value.replace(/\s+/gu, " ").trim();
+}
 
-  available(ctx: ExtensionContext): FeedbackTarget[] {
-    const live = this.targetsFromBranch(ctx);
-    this.targets.clear();
-    for (const target of live) this.targets.set(target.taskKey, target);
-    return live;
-  }
-
-  snapshot(ctx: ExtensionContext, taskKey: string, storageMode: "local_only" | "ask"): FeedbackSnapshot | undefined {
-    const target = this.available(ctx).find((item) => item.taskKey === taskKey);
-    if (!target) return undefined;
+export async function selectConversationTurns(
+  ctx: ExtensionCommandContext,
+  turns: ConversationTurn[],
+): Promise<ConversationTurn[] | null> {
+  if (ctx.mode !== "tui") throw new Error("/pref feedback 需要交互式 TUI 选择对话");
+  return ctx.ui.custom<ConversationTurn[] | null>((tui, theme, _keybindings, done) => {
+    let cursor = Math.max(0, turns.length - 1);
+    const selected = new Set<number>();
     return {
-      session_id: `session-${createHash("sha256").update(ctx.sessionManager.getSessionId()).digest("hex").slice(0, 24)}`,
-      task_key: target.taskKey,
-      user_entry_id: target.userEntryId,
-      assistant_entry_id: target.assistantEntryId,
-      user_text: target.userText,
-      assistant_text: target.assistantText,
-      origin_verified: true,
-      storage_mode: storageMode,
+      render(width: number): string[] {
+        const lines = [
+          truncateToWidth(theme.fg("accent", theme.bold("选择最近对话")), width),
+          truncateToWidth(theme.fg("dim", "Space 勾选/取消 · ↑↓ 移动 · Enter 完成 · Esc 取消"), width),
+          "",
+        ];
+        const terminalRows = Math.max(4, Number(tui.terminal?.rows) || 24);
+        const visibleCount = Math.max(1, Math.floor((terminalRows - lines.length) / 3));
+        const start = Math.max(0, Math.min(
+          cursor - Math.floor(visibleCount / 2),
+          Math.max(0, turns.length - visibleCount),
+        ));
+        const end = Math.min(turns.length, start + visibleCount);
+        for (let index = start; index < end; index += 1) {
+          const turn = turns[index]!;
+          const pointer = index === cursor ? theme.fg("accent", ">") : " ";
+          const box = selected.has(index) ? theme.fg("success", "[x]") : theme.fg("dim", "[ ]");
+          const title = `${pointer} ${box} ${index + 1}. 用户：${preview(turn.user)}`;
+          lines.push(truncateToWidth(title, width, "…"));
+          const assistant = theme.fg("muted", `      助手：${preview(turn.assistant)}`);
+          lines.push(...wrapTextWithAnsi(assistant, Math.max(1, width)).slice(0, 2));
+        }
+        return lines;
+      },
+      handleInput(data: string): void {
+        if (matchesKey(data, Key.up)) cursor = Math.max(0, cursor - 1);
+        else if (matchesKey(data, Key.down)) cursor = Math.min(turns.length - 1, cursor + 1);
+        else if (matchesKey(data, Key.space)) {
+          if (selected.has(cursor)) selected.delete(cursor);
+          else selected.add(cursor);
+        } else if (matchesKey(data, Key.enter)) {
+          done([...selected].sort((a, b) => a - b).map((index) => turns[index]!));
+          return;
+        } else if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+          done(null);
+          return;
+        }
+        tui.requestRender();
+      },
+      invalidate(): void {},
     };
-  }
+  });
 }

@@ -1,9 +1,15 @@
-import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { resolve } from "node:path";
-import type { PreferenceCliInvoker } from "./group.ts";
+import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+
+export type PreferenceCliInvoker = (
+  args: string[],
+  input?: unknown,
+  timeoutMs?: number,
+) => Promise<Record<string, unknown>>;
 
 export interface PreferenceGroup {
-  id?: string;
+  id: string;
+  revision: number;
   name: string;
   description: string;
   rules: string[];
@@ -13,21 +19,8 @@ export interface PreferenceStatus {
   enabled?: boolean;
   groups?: number;
   rules?: number;
-  pending_evidence_count?: number;
   pending_feedback_count?: number;
-  pending_evidence_withdrawal_publish_count?: number;
   pending_proposal_count?: number;
-  pending_proposal_job_count?: number;
-  model_ready?: boolean | null;
-  model_status?: string;
-  provider_source?: string;
-  provider_name?: string;
-  provider_model?: string;
-  provider_thinking_level?: string;
-  provider_timeout_seconds?: number;
-  provider_base_url_ready?: boolean | null;
-  provider_credential_env?: string;
-  provider_credential_ready?: boolean | null;
   sync_state?: string;
   [key: string]: unknown;
 }
@@ -35,12 +28,7 @@ export interface PreferenceStatus {
 export interface DashboardActions {
   remember: (rule: string) => Promise<void>;
   feedback: () => Promise<void>;
-  feedbackLocalOnly?: () => Promise<void>;
-  manageFeedback?: () => Promise<void>;
-  manageEvidence?: () => Promise<void>;
-  manageProposals?: () => Promise<void>;
-  manageHistory?: () => Promise<void>;
-  manageSettings?: () => Promise<void>;
+  feedbackDetails: () => Promise<void>;
   sessionId: string;
 }
 
@@ -50,433 +38,195 @@ interface ContextResult {
   session_groups: string[];
 }
 
-function text(value: unknown, defaultText = ""): string {
-  return typeof value === "string" ? value : defaultText;
-}
-
-function number(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
-}
-
-function groupList(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return value.filter((item): item is string => typeof item === "string");
+function strings(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
 function parseGroups(value: Record<string, unknown>): PreferenceGroup[] {
   if (!Array.isArray(value.groups)) throw new Error("groups CLI returned no groups");
-  return value.groups.map((item) => {
-    if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("groups CLI returned an invalid group");
-    const group = item as Record<string, unknown>;
-    if (typeof group.name !== "string" || typeof group.description !== "string" || !Array.isArray(group.rules)
-        || group.rules.some((rule) => typeof rule !== "string" && (!rule || typeof rule !== "object" || Array.isArray(rule) || typeof (rule as Record<string, unknown>).text !== "string"))) {
+  return value.groups.map((raw) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("groups CLI returned an invalid group");
+    const group = raw as Record<string, unknown>;
+    if (typeof group.id !== "string" || typeof group.revision !== "number" || typeof group.name !== "string"
+      || typeof group.description !== "string" || !Array.isArray(group.rules)) {
       throw new Error("groups CLI returned an invalid group");
     }
-    return {
-      ...(typeof group.id === "string" ? { id: group.id } : {}),
-      name: group.name,
-      description: group.description,
-      rules: group.rules.map((rule) => typeof rule === "string" ? rule : String((rule as Record<string, unknown>).text)),
-    };
+    const rules = group.rules.map((rule) => {
+      if (typeof rule === "string") return rule;
+      if (rule && typeof rule === "object" && !Array.isArray(rule) && typeof (rule as Record<string, unknown>).text === "string") {
+        return String((rule as Record<string, unknown>).text);
+      }
+      throw new Error("groups CLI returned an invalid rule");
+    });
+    return { id: group.id, revision: group.revision, name: group.name, description: group.description, rules };
   });
 }
 
-async function loadGroups(invokeCli: PreferenceCliInvoker): Promise<PreferenceGroup[]> {
-  return parseGroups(await invokeCli(["groups"]));
+async function groups(invoke: PreferenceCliInvoker): Promise<PreferenceGroup[]> {
+  return parseGroups(await invoke(["groups"]));
 }
 
-async function loadContext(
-  ctx: ExtensionCommandContext,
-  invokeCli: PreferenceCliInvoker,
-  sessionId: string,
-): Promise<ContextResult> {
-  const result = await invokeCli(["context", "--stdin"], {
-    directory: resolve(ctx.cwd),
-    session_id: sessionId,
-  });
-  const effective = groupList(result.effective_groups);
-  if (!Array.isArray(result.directory_groups) || !Array.isArray(result.session_groups)) {
-    throw new Error("context CLI returned an invalid activation document");
-  }
+async function context(ctx: ExtensionCommandContext, invoke: PreferenceCliInvoker, sessionId: string): Promise<ContextResult> {
+  const value = await invoke(["context", "--stdin"], { directory: resolve(ctx.cwd), session_id: sessionId });
   return {
-    effective_groups: effective,
-    directory_groups: groupList(result.directory_groups),
-    session_groups: groupList(result.session_groups),
+    effective_groups: strings(value.effective_groups),
+    directory_groups: strings(value.directory_groups),
+    session_groups: strings(value.session_groups),
   };
 }
 
-function shorten(value: string, limit: number): string {
-  return value.length <= limit ? value : `${value.slice(0, Math.max(1, limit - 1))}…`;
+async function chooseGroup(ctx: ExtensionCommandContext, values: PreferenceGroup[], title: string): Promise<PreferenceGroup | undefined> {
+  if (!values.length) {
+    ctx.ui.notify("当前没有可选偏好组。", "info");
+    return undefined;
+  }
+  const name = await ctx.ui.select(title, values.map((group) => group.name));
+  return values.find((group) => group.name === name);
 }
 
-function compactGroups(groups: string[]): string {
-  if (!groups.length) return "无";
-  const ordered = [
-    ...groups.filter((group) => group !== "global"),
-    ...groups.filter((group) => group === "global"),
-  ];
-  return ordered.join("、");
+function syncLabel(value: unknown): string {
+  const labels: Record<string, string> = { "no-remote": "本地", clean: "已同步", ahead: "待推送", behind: "待拉取", diverged: "已分叉", error: "同步异常" };
+  return labels[String(value)] ?? String(value ?? "未知");
 }
 
-function compactSync(value: unknown): string {
-  const labels: Record<string, string> = {
-    "no-remote": "本地",
-    clean: "已同步",
-    ahead: "待推送",
-    behind: "待拉取",
-    diverged: "已分叉",
-    error: "同步异常",
-  };
-  const state = text(value, "error");
-  return labels[state] ?? shorten(state, 12);
-}
-
-export function formatPreferenceSummary(status: PreferenceStatus, effectiveGroups: string[] = []): string {
+export function formatPreferenceSummary(status: PreferenceStatus, effective: string[] = []): string {
+  const groupCount = typeof status.groups === "number" ? status.groups : 0;
+  const ruleCount = typeof status.rules === "number" ? status.rules : 0;
   const parts = [
-    status.enabled === false ? "偏好已停用" : `启用：${compactGroups(effectiveGroups)}`,
-    `共${number(status.groups)}组/${number(status.rules)}规则`,
+    status.enabled === false ? "偏好已停用" : `启用：${effective.join("、") || "无"}`,
+    `共${groupCount}组/${ruleCount}规则`,
   ];
-  const pending = number(status.pending_evidence_count);
-  const pendingFeedback = number(status.pending_feedback_count);
-  if (pendingFeedback > 0) parts.push(`${pendingFeedback}条整理中`);
-  if (pending > 0) parts.push(`${pending}条待复核`);
-  const pendingWithdrawals = number(status.pending_evidence_withdrawal_publish_count);
-  if (pendingWithdrawals > 0) parts.push(`${pendingWithdrawals}条撤回待发布`);
-  const pendingProposals = number(status.pending_proposal_count);
-  const pendingProposalJobs = number(status.pending_proposal_job_count);
-  if (pendingProposalJobs > 0) parts.push(`${pendingProposalJobs}条候选生成中`);
-  if (pendingProposals > 0) parts.push(`${pendingProposals}批候选待处理`);
-  if (status.model_ready === false) parts.push("模型未就绪");
-  parts.push(compactSync(status.sync_state));
+  if (Number(status.pending_feedback_count) > 0) parts.push(`${Number(status.pending_feedback_count)}条待整理`);
+  if (Number(status.pending_proposal_count) > 0) parts.push(`${Number(status.pending_proposal_count)}批待确认`);
+  parts.push(syncLabel(status.sync_state));
   return parts.join(" · ");
 }
 
-function formatPreferenceDetails(status: PreferenceStatus): string {
-  const source = text(status.provider_source, "custom");
-  const provider = `${text(status.provider_name, "unknown")}/${text(status.provider_model, "unknown")}`;
-  const thinking = text(status.provider_thinking_level, "off");
-  const timeout = number(status.provider_timeout_seconds);
-  const model = status.model_ready === true
-    ? `${source} ${provider} · thinking ${thinking} · timeout ${timeout}s`
-    : status.model_ready === false
-      ? `${source} ${provider} · 未就绪：${text(status.model_status, "未配置")}`
-      : `${source} ${provider} · 未检查：${text(status.model_status, "仅在绑定或发送时检查")}`;
-  return `模型：${model}\n同步：${text(status.sync_state, "error")}`;
-}
-
-function groupDetails(group: PreferenceGroup, context: ContextResult): string {
-  const directory = group.name === "global" || context.directory_groups.includes(group.name) ? "已启用" : "未启用";
-  const session = group.name === "global" || context.session_groups.includes(group.name) ? "已启用" : "未启用";
+function groupDetails(group: PreferenceGroup, active: ContextResult): string {
   return [
     `组名：${group.name}`,
     `组介绍：${group.description}`,
-    `当前目录：${directory}`,
-    `当前会话：${session}`,
+    `当前目录：${group.name === "global" || active.directory_groups.includes(group.name) ? "已启用" : "未启用"}`,
+    `当前会话：${group.name === "global" || active.session_groups.includes(group.name) ? "已启用" : "未启用"}`,
     "组内规则：",
     ...(group.rules.length ? group.rules.map((rule) => `- ${rule}`) : ["（暂无规则）"]),
   ].join("\n");
 }
 
-async function selectGroup(
-  ctx: ExtensionCommandContext,
-  groups: PreferenceGroup[],
-  title: string,
-): Promise<PreferenceGroup | undefined> {
-  if (!groups.length) {
-    ctx.ui.notify("当前没有偏好组。", "info");
-    return undefined;
-  }
-  const selected = await ctx.ui.select(title, groups.map((group) => group.name));
-  if (!selected) return undefined;
-  return groups.find((group) => group.name === selected);
-}
-
-async function manage(
-  ctx: ExtensionCommandContext,
-  invokeCli: PreferenceCliInvoker,
-  payload: Record<string, unknown>,
-): Promise<Record<string, unknown>> {
-  const result = await invokeCli(["manage-group", "--stdin"], payload);
-  ctx.ui.notify(`偏好组已更新：${text(result.group, "完成")}`, "info");
-  return result;
-}
-
-async function viewGroups(
-  ctx: ExtensionCommandContext,
-  invokeCli: PreferenceCliInvoker,
-  sessionId: string,
-): Promise<void> {
-  const groups = await loadGroups(invokeCli);
-  const context = await loadContext(ctx, invokeCli, sessionId);
-  const group = await selectGroup(ctx, groups, "查看偏好组");
-  if (group) ctx.ui.notify(groupDetails(group, context), "info");
-}
-
-async function createGroup(
-  ctx: ExtensionCommandContext,
-  invokeCli: PreferenceCliInvoker,
-): Promise<void> {
-  const name = (await ctx.ui.input("输入组名", "例如 coding"))?.trim();
-  if (!name) return;
-  const description = (await ctx.ui.input("输入组介绍", "说明这个组适用什么场景"))?.trim();
-  if (!description) return;
-  await manage(ctx, invokeCli, { action: "create", name, description });
-}
-
-async function editDescription(
-  ctx: ExtensionCommandContext,
-  invokeCli: PreferenceCliInvoker,
-): Promise<void> {
-  for (;;) {
-    const groups = await loadGroups(invokeCli);
-    const group = await selectGroup(ctx, groups, "编辑组介绍");
-    if (!group) return;
-    const description = await ctx.ui.editor("编辑组介绍", group.description);
-    if (description === undefined) continue;
-    if (!description.trim()) throw new Error("组介绍不能为空");
-    await manage(ctx, invokeCli, {
-      action: "update_description",
-      group: group.name,
-      description: description.trim(),
-    });
+async function manageGroup(ctx: ExtensionCommandContext, invoke: PreferenceCliInvoker, sessionId: string): Promise<void> {
+  const action = await ctx.ui.select("管理偏好组", ["查看", "创建", "编辑介绍", "删除", "管理规则", "返回"]);
+  if (!action || action === "返回") return;
+  const values = await groups(invoke);
+  if (action === "查看") {
+    const selected = await chooseGroup(ctx, values, "查看偏好组");
+    if (selected) ctx.ui.notify(groupDetails(selected, await context(ctx, invoke, sessionId)), "info");
     return;
   }
-}
-
-async function deleteGroup(
-  ctx: ExtensionCommandContext,
-  invokeCli: PreferenceCliInvoker,
-): Promise<void> {
-  const groups = await loadGroups(invokeCli);
-  const group = await selectGroup(ctx, groups, "删除偏好组");
-  if (!group) return;
-  await manage(ctx, invokeCli, { action: "delete", group: group.name });
-}
-
-async function manageRules(
-  ctx: ExtensionCommandContext,
-  invokeCli: PreferenceCliInvoker,
-  sessionId: string,
-): Promise<void> {
-  for (;;) {
-    const groups = await loadGroups(invokeCli);
-    const context = await loadContext(ctx, invokeCli, sessionId);
-    const group = await selectGroup(ctx, groups, "选择要管理的组");
-    if (!group) return;
-
-    for (;;) {
-      const action = await ctx.ui.select("管理组内规则", [
-        "查看规则",
-        "增加规则",
-        "修改规则",
-        "删除规则",
-        "移动到其他组",
-        "返回上一级",
-      ]);
-      if (!action || action === "返回上一级") break;
-      if (action === "查看规则") {
-        ctx.ui.notify(groupDetails(group, context), "info");
-        continue;
-      }
-      if (action === "增加规则") {
-        const rule = (await ctx.ui.input("增加规则", "输入组内规则"))?.trim();
-        if (!rule) continue;
-        await manage(ctx, invokeCli, { action: "add_rule", group: group.name, rule });
-        return;
-      }
-      if (!group.rules.length) {
-        ctx.ui.notify("当前组没有规则。", "info");
-        continue;
-      }
-
-      for (;;) {
-        const selected = await ctx.ui.select("选择规则", group.rules);
-        if (!selected) break;
-        if (action === "修改规则") {
-          const replacement = await ctx.ui.editor("修改规则", selected);
-          if (replacement === undefined) continue;
-          if (!replacement.trim()) throw new Error("规则不能为空");
-          await manage(ctx, invokeCli, {
-            action: "update_rule",
-            group: group.name,
-            rule: selected,
-            replacement: replacement.trim(),
-          });
-          return;
-        }
-        if (action === "删除规则") {
-          await manage(ctx, invokeCli, { action: "delete_rule", group: group.name, rule: selected });
-          return;
-        }
-        const targets = groups.filter((item) => item.name !== group.name);
-        const target = await selectGroup(ctx, targets, "移动到其他组");
-        if (!target) continue;
-        await manage(ctx, invokeCli, {
-          action: "move_rule",
-          source_group: group.name,
-          target_group: target.name,
-          rule: selected,
-        });
-        return;
-      }
-    }
+  if (action === "创建") {
+    const name = (await ctx.ui.input("组名", "例如 coding"))?.trim();
+    if (!name) return;
+    const description = (await ctx.ui.input("组介绍", "说明这个组适用什么场景"))?.trim();
+    if (!description) return;
+    await invoke(["manage-group", "--stdin"], { action: "create", name, description });
+    ctx.ui.notify(`已创建偏好组：${name}`, "info");
+    return;
+  }
+  const selected = await chooseGroup(ctx, values, "选择偏好组");
+  if (!selected) return;
+  if (action === "编辑介绍") {
+    const description = (await ctx.ui.editor("编辑组介绍", selected.description))?.trim();
+    if (!description) return;
+    await invoke(["manage-group", "--stdin"], { action: "update_description", group: selected.name, description });
+    return;
+  }
+  if (action === "删除") {
+    if (!await ctx.ui.confirm("删除偏好组？", `将删除正式组 ${selected.name} 及其规则；本机历史反馈和证据继续保留。`)) return;
+    await invoke(["manage-group", "--stdin"], { action: "delete", group: selected.name });
+    return;
+  }
+  const ruleAction = await ctx.ui.select("管理组内规则", ["增加", "修改", "删除", "移动", "返回"]);
+  if (!ruleAction || ruleAction === "返回") return;
+  if (ruleAction === "增加") {
+    const rule = (await ctx.ui.input("增加规则", "输入组内规则"))?.trim();
+    if (rule) await invoke(["manage-group", "--stdin"], { action: "add_rule", group: selected.name, rule });
+    return;
+  }
+  if (!selected.rules.length) {
+    ctx.ui.notify("当前组没有规则。", "info");
+    return;
+  }
+  const rule = await ctx.ui.select("选择规则", selected.rules);
+  if (!rule) return;
+  if (ruleAction === "修改") {
+    const replacement = (await ctx.ui.editor("修改规则", rule))?.trim();
+    if (replacement) await invoke(["manage-group", "--stdin"], { action: "update_rule", group: selected.name, rule, replacement });
+  } else if (ruleAction === "删除") {
+    if (await ctx.ui.confirm("删除规则？", rule)) await invoke(["manage-group", "--stdin"], { action: "delete_rule", group: selected.name, rule });
+  } else {
+    const target = await chooseGroup(ctx, values.filter((group) => group.id !== selected.id), "移动到其他组");
+    if (target) await invoke(["manage-group", "--stdin"], { action: "move_rule", source_group: selected.name, target_group: target.name, rule });
   }
 }
 
 async function setActivation(
   ctx: ExtensionCommandContext,
-  invokeCli: PreferenceCliInvoker,
+  invoke: PreferenceCliInvoker,
   sessionId: string,
   target: "directory" | "session",
   enabled: boolean,
 ): Promise<void> {
-  const groups = await loadGroups(invokeCli);
-  const context = await loadContext(ctx, invokeCli, sessionId);
-  const current = target === "directory" ? context.directory_groups : context.session_groups;
-  const options = enabled
-    ? groups.filter((group) => group.name !== "global" && !current.includes(group.name))
-    : groups.filter((group) => group.name !== "global" && current.includes(group.name));
-  const group = await selectGroup(ctx, options, enabled ? "为当前上下文启用组" : "为当前上下文禁用组");
+  const values = await groups(invoke);
+  const active = await context(ctx, invoke, sessionId);
+  const current = target === "directory" ? active.directory_groups : active.session_groups;
+  const options = values.filter((group) => group.name !== "global" && (enabled ? !current.includes(group.name) : current.includes(group.name)));
+  const group = await chooseGroup(ctx, options, enabled ? "启用偏好组" : "禁用偏好组");
   if (!group) return;
-  await invokeCli(["set-activation", "--stdin"], {
+  await invoke(["set-activation", "--stdin"], {
     target,
     key: target === "directory" ? resolve(ctx.cwd) : sessionId,
     group: group.name,
     enabled,
   });
-  ctx.ui.notify(`${enabled ? "已启用" : "已禁用"} ${group.name}`, "info");
 }
 
 export async function showPreferenceDashboard(
   ctx: ExtensionCommandContext,
-  invokeCli: PreferenceCliInvoker,
+  invoke: PreferenceCliInvoker,
   actions: DashboardActions,
 ): Promise<void> {
-  let introShown = false;
   for (;;) {
-    const status = await invokeCli(["status"]) as PreferenceStatus;
-    const context = await loadContext(ctx, invokeCli, actions.sessionId);
-    const effectiveGroups = status.enabled === false ? [] : context.effective_groups;
-    const summary = formatPreferenceSummary(status, effectiveGroups);
-    if (!ctx.hasUI) {
-      ctx.ui.notify(summary, "info");
-      return;
-    }
+    const status = await invoke(["status"]) as PreferenceStatus;
+    const active = await context(ctx, invoke, actions.sessionId);
+    const summary = formatPreferenceSummary(status, status.enabled === false ? [] : active.effective_groups);
     ctx.ui.setStatus("personal-preferences", summary);
-    if (!introShown) {
-      ctx.ui.notify([
-        "个人偏好",
-        `当前有效：${effectiveGroups.join("、") || "无"}`,
-        formatPreferenceDetails(status),
-      ].join("\n"), "info");
-      introShown = true;
-    }
-
     const choice = await ctx.ui.select("个人偏好", [
-      "查看偏好组",
-      "创建偏好组",
-      "编辑组介绍",
-      "删除偏好组",
-      "管理组内规则",
+      "查看当前状态",
+      "记录反馈",
+      "查看反馈详情",
+      "记住一条规则",
+      "管理组与规则",
       "为当前目录启用组",
       "为当前目录禁用组",
       "为当前会话启用组",
       "为当前会话禁用组",
-      "记录反馈",
-      "仅本机保存反馈",
-      "管理反馈任务",
-      "管理学习证据",
-      "生成与审核候选规则",
-      "查看规则来源与历史",
-      "学习设置与隐私",
-      "同步偏好仓库",
-      "撤销最近一次变化",
+      "同步正式规则",
+      "退出",
     ]);
-    if (!choice) return;
-    if (choice === "查看偏好组") {
-      await viewGroups(ctx, invokeCli, actions.sessionId);
-      continue;
+    if (!choice || choice === "退出") return;
+    if (choice === "查看当前状态") ctx.ui.notify(summary, "info");
+    else if (choice === "记录反馈") await actions.feedback();
+    else if (choice === "查看反馈详情") await actions.feedbackDetails();
+    else if (choice === "记住一条规则") {
+      const rule = (await ctx.ui.input("记住规则", "输入明确规则"))?.trim();
+      if (rule) await actions.remember(rule);
+    } else if (choice === "管理组与规则") await manageGroup(ctx, invoke, actions.sessionId);
+    else if (choice === "为当前目录启用组") await setActivation(ctx, invoke, actions.sessionId, "directory", true);
+    else if (choice === "为当前目录禁用组") await setActivation(ctx, invoke, actions.sessionId, "directory", false);
+    else if (choice === "为当前会话启用组") await setActivation(ctx, invoke, actions.sessionId, "session", true);
+    else if (choice === "为当前会话禁用组") await setActivation(ctx, invoke, actions.sessionId, "session", false);
+    else if (choice === "同步正式规则") {
+      const result = await invoke(["sync"], undefined, 180_000);
+      ctx.ui.notify(`正式规则同步完成：${syncLabel(result.sync_state)}`, "info");
     }
-    if (choice === "创建偏好组") {
-      await createGroup(ctx, invokeCli);
-      continue;
-    }
-    if (choice === "编辑组介绍") {
-      await editDescription(ctx, invokeCli);
-      continue;
-    }
-    if (choice === "删除偏好组") {
-      await deleteGroup(ctx, invokeCli);
-      continue;
-    }
-    if (choice === "管理组内规则") {
-      await manageRules(ctx, invokeCli, actions.sessionId);
-      continue;
-    }
-    if (choice === "为当前目录启用组") {
-      await setActivation(ctx, invokeCli, actions.sessionId, "directory", true);
-      continue;
-    }
-    if (choice === "为当前目录禁用组") {
-      await setActivation(ctx, invokeCli, actions.sessionId, "directory", false);
-      continue;
-    }
-    if (choice === "为当前会话启用组") {
-      await setActivation(ctx, invokeCli, actions.sessionId, "session", true);
-      continue;
-    }
-    if (choice === "为当前会话禁用组") {
-      await setActivation(ctx, invokeCli, actions.sessionId, "session", false);
-      continue;
-    }
-    if (choice === "记录反馈") {
-      await actions.feedback();
-      continue;
-    }
-    if (choice === "仅本机保存反馈") {
-      await actions.feedbackLocalOnly?.();
-      continue;
-    }
-    if (choice === "管理反馈任务") {
-      await actions.manageFeedback?.();
-      continue;
-    }
-    if (choice === "管理学习证据") {
-      await actions.manageEvidence?.();
-      continue;
-    }
-    if (choice === "生成与审核候选规则") {
-      await actions.manageProposals?.();
-      continue;
-    }
-    if (choice === "查看规则来源与历史") {
-      await actions.manageHistory?.();
-      continue;
-    }
-    if (choice === "学习设置与隐私") {
-      await actions.manageSettings?.();
-      continue;
-    }
-    if (choice === "同步偏好仓库") {
-      const result = await invokeCli(["sync"], undefined, 120_000);
-      if (typeof result.push_error === "string") {
-        ctx.ui.notify(`本地偏好已提交，远端推送失败：${result.push_error}（${text(result.sync_state, "error")}）`, "warning");
-      } else {
-        ctx.ui.notify(`偏好同步完成：${text(result.sync_state, "unknown")}。`, "info");
-      }
-      continue;
-    }
-    const preview = await invokeCli(["rollback", "--preview"], undefined, 120_000);
-    const confirmed = await ctx.ui.confirm("撤销最近一次变化？", [
-      `目标 operation：${text(preview.target_operation_id, "未知")}`,
-      `目标 commit：${text(preview.target_commit, "未知")}`,
-      `当前 HEAD：${text(preview.expected_head, "未知")}`,
-      `类型：${text(preview.kind, "未知")} · 时间：${text(preview.created_at, "未知")}`,
-      "将只撤销规则/组效果并追加 reverts_operation_id；evidence、withdraw 和审核历史保留：",
-      text(preview.diff, "无 diff"),
-    ].join("\n"));
-    if (!confirmed) continue;
-    await invokeCli(["rollback", "--stdin"], { expected_operation_id: preview.target_operation_id, expected_head: preview.expected_head }, 120_000);
-    ctx.ui.notify("最近一次偏好 operation 已通过新提交撤销。", "info");
   }
 }

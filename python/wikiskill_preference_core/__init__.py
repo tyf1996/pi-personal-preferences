@@ -1,48 +1,19 @@
-"""Independent personal preference group mode for WikiSkill."""
+"""Minimal personal-preference storage contracts."""
 
-from .classification import classify_group
-from .config import PreferenceConfig, default_config
-from .contracts import (
-    EvolutionAction,
-    EvolutionChange,
-    EvolutionResponse,
-    GroupActivationDocument,
-    GroupActivationDocumentV2,
-    GroupClassificationRequest,
-    GroupClassificationResult,
-    PreferenceEvent,
-    PreferenceGroup,
-    PreferenceGroupV2,
-    PreferenceGroupsDocument,
-    PreferenceGroupsDocumentV2,
-    PreferenceRuleV2,
-    Signal,
+from .errors import (
+    PreferenceConflictError,
+    PreferenceError,
+    PreferenceGitError,
+    PreferenceIntegrityError,
+    PreferenceValidationError,
 )
-from .learning_contracts import Change, Proposal, ProposalJob
-from .proposals import ProposalStore
-from .store import PreferenceStore
+from .storage import PreferenceStore
 
 __all__ = [
-    "Change",
-    "EvolutionAction",
-    "EvolutionChange",
-    "EvolutionResponse",
-    "GroupActivationDocument",
-    "GroupActivationDocumentV2",
-    "GroupClassificationRequest",
-    "GroupClassificationResult",
-    "PreferenceConfig",
-    "PreferenceEvent",
-    "PreferenceGroup",
-    "PreferenceGroupV2",
-    "PreferenceGroupsDocument",
-    "PreferenceGroupsDocumentV2",
-    "PreferenceRuleV2",
+    "PreferenceConflictError",
+    "PreferenceError",
+    "PreferenceGitError",
+    "PreferenceIntegrityError",
     "PreferenceStore",
-    "Proposal",
-    "ProposalJob",
-    "ProposalStore",
-    "Signal",
-    "classify_group",
-    "default_config",
+    "PreferenceValidationError",
 ]
