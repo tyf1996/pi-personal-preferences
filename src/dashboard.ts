@@ -21,6 +21,8 @@ export interface PreferenceStatus {
   rules?: number;
   pending_feedback_count?: number;
   pending_proposal_count?: number;
+  pending_evolution_count?: number;
+  actionable_count?: number;
   sync_state?: string;
   [key: string]: unknown;
 }
@@ -28,7 +30,9 @@ export interface PreferenceStatus {
 export interface DashboardActions {
   remember: (rule: string) => Promise<void>;
   feedback: () => Promise<void>;
-  feedbackDetails: () => Promise<void>;
+  evidence: () => Promise<void>;
+  reprocess: () => Promise<void>;
+  pending: () => Promise<void>;
   sessionId: string;
 }
 
@@ -89,17 +93,26 @@ function syncLabel(value: unknown): string {
   return labels[String(value)] ?? String(value ?? "未知");
 }
 
-export function formatPreferenceSummary(status: PreferenceStatus, effective: string[] = []): string {
-  const groupCount = typeof status.groups === "number" ? status.groups : 0;
-  const ruleCount = typeof status.rules === "number" ? status.rules : 0;
-  const parts = [
-    status.enabled === false ? "偏好已停用" : `启用：${effective.join("、") || "无"}`,
-    `共${groupCount}组/${ruleCount}规则`,
-  ];
-  if (Number(status.pending_feedback_count) > 0) parts.push(`${Number(status.pending_feedback_count)}条待整理`);
-  if (Number(status.pending_proposal_count) > 0) parts.push(`${Number(status.pending_proposal_count)}批待确认`);
-  parts.push(syncLabel(status.sync_state));
+export function formatPreferenceSummary(
+  status: PreferenceStatus,
+  effective: string[] = [],
+  activity: { background?: boolean; actionable?: number } = {},
+): string {
+  const parts = [status.enabled === false ? "偏好：停用" : `偏好：${effective.join("、") || "无"}`];
+  if (activity.background) parts.push("后台处理中");
+  if (Number(activity.actionable) > 0) parts.push(`待处理${Number(activity.actionable)}`);
   return parts.join(" · ");
+}
+
+function formatPreferenceDetails(status: PreferenceStatus, active: ContextResult): string {
+  return [
+    formatPreferenceSummary(status, status.enabled === false ? [] : active.effective_groups),
+    `总量：${Number(status.groups ?? 0)} 组 / ${Number(status.rules ?? 0)} 条规则 / ${Number(status.saved_feedback_count ?? 0)} 条反馈`,
+    `待处理：${Number(status.actionable_count ?? 0)}`,
+    `正式规则同步：${syncLabel(status.sync_state)}`,
+    `目录启用：${active.directory_groups.join("、") || "无"}`,
+    `会话启用：${active.session_groups.join("、") || "无"}`,
+  ].join("\n");
 }
 
 function groupDetails(group: PreferenceGroup, active: ContextResult): string {
@@ -197,12 +210,17 @@ export async function showPreferenceDashboard(
   for (;;) {
     const status = await invoke(["status"]) as PreferenceStatus;
     const active = await context(ctx, invoke, actions.sessionId);
-    const summary = formatPreferenceSummary(status, status.enabled === false ? [] : active.effective_groups);
-    ctx.ui.setStatus("personal-preferences", summary);
+    const summary = formatPreferenceSummary(
+      status,
+      status.enabled === false ? [] : active.effective_groups,
+      { actionable: Number(status.actionable_count ?? 0) },
+    );
     const choice = await ctx.ui.select("个人偏好", [
       "查看当前状态",
       "记录反馈",
-      "查看反馈详情",
+      "反馈与证据",
+      "重新整理反馈",
+      "处理待办",
       "记住一条规则",
       "管理组与规则",
       "为当前目录启用组",
@@ -213,9 +231,17 @@ export async function showPreferenceDashboard(
       "退出",
     ]);
     if (!choice || choice === "退出") return;
-    if (choice === "查看当前状态") ctx.ui.notify(summary, "info");
-    else if (choice === "记录反馈") await actions.feedback();
-    else if (choice === "查看反馈详情") await actions.feedbackDetails();
+    if (choice === "查看当前状态") ctx.ui.notify(formatPreferenceDetails(status, active), "info");
+    else if (choice === "记录反馈") {
+      await actions.feedback();
+      return;
+    }
+    else if (choice === "反馈与证据") await actions.evidence();
+    else if (choice === "重新整理反馈") {
+      await actions.reprocess();
+      return;
+    }
+    else if (choice === "处理待办") await actions.pending();
     else if (choice === "记住一条规则") {
       const rule = (await ctx.ui.input("记住规则", "输入明确规则"))?.trim();
       if (rule) await actions.remember(rule);

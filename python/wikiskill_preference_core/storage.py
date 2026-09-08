@@ -247,6 +247,23 @@ def validate_evidence(value: Any) -> dict[str, Any]:
     }
 
 
+def validate_extraction(value: Any) -> dict[str, Any]:
+    data = _strict_object(value, {"group", "evidence"}, {"group", "evidence"}, "extraction")
+    group = _strict_object(data["group"], {"name", "certain", "reason"}, {"name", "certain", "reason"}, "extraction.group")
+    if group["name"] is not None and not isinstance(group["name"], str):
+        raise PreferenceValidationError("extraction.group.name must be a string or null")
+    if not isinstance(group["certain"], bool):
+        raise PreferenceValidationError("extraction.group.certain must be boolean")
+    return {
+        "group": {
+            "name": _optional_text(group["name"], "extraction.group.name", 128),
+            "certain": group["certain"],
+            "reason": checked_text(group["reason"], "extraction.group.reason", maximum=1000),
+        },
+        "evidence": validate_evidence(data["evidence"]),
+    }
+
+
 def validate_proposed_rules(value: Any) -> list[str]:
     if not isinstance(value, list) or len(value) > 200:
         raise PreferenceValidationError("proposed_rules must be a list with at most 200 items")
@@ -261,8 +278,9 @@ def _optional_text(value: Any, label: str, maximum: int) -> str | None:
 
 
 def validate_feedback_record(value: Any) -> dict[str, Any]:
-    fields = {"id", "created_at", "sentiment", "reason", "selected_turns", "model", "group_name", "status", "evidence_id", "error"}
-    data = _strict_object(value, fields, fields, "stored feedback")
+    required = {"id", "created_at", "sentiment", "reason", "selected_turns", "model", "group_name", "status", "evidence_id", "error"}
+    allowed = required | {"extraction"}
+    data = _strict_object(value, required, allowed, "stored feedback")
     if data["sentiment"] not in {"good", "fix"} or data["status"] not in {"saved", "pending_group", "organized", "failed"}:
         raise PreferenceIntegrityError("stored feedback state is invalid")
     if not isinstance(data["selected_turns"], list) or not 1 <= len(data["selected_turns"]) <= 10:
@@ -278,6 +296,7 @@ def validate_feedback_record(value: Any) -> dict[str, Any]:
         "status": data["status"],
         "evidence_id": None if data["evidence_id"] is None else checked_id(data["evidence_id"], "feedback.evidence_id"),
         "error": _optional_text(data["error"], "feedback.error", 500),
+        "extraction": None if data.get("extraction") is None else validate_extraction(data["extraction"]),
     }
 
 

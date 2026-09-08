@@ -71,15 +71,15 @@ function secondLine(snapshot: PreferenceFooterSnapshot, width: number): string {
   if (snapshot.cacheReadTokens) stats.push(`R${formatTokens(snapshot.cacheReadTokens)}`);
   if (snapshot.cacheWriteTokens) stats.push(`W${formatTokens(snapshot.cacheWriteTokens)}`);
   if (snapshot.cost) stats.push(`$${snapshot.cost.toFixed(3)}`);
-  const context = snapshot.contextPercent === null || snapshot.contextPercent === undefined
-    ? `?/${formatTokens(snapshot.contextWindow ?? 0)}`
-    : `${snapshot.contextPercent.toFixed(1)}%/${formatTokens(snapshot.contextWindow ?? 0)}`;
-  stats.push(context);
+  if (snapshot.contextPercent !== null && snapshot.contextPercent !== undefined && Number(snapshot.contextWindow) > 0) {
+    stats.push(`${snapshot.contextPercent.toFixed(1)}%/${formatTokens(snapshot.contextWindow!)}`);
+  }
   const model = snapshot.model
     ? `${snapshot.model}${snapshot.thinkingLevel ? ` • ${snapshot.thinkingLevel}` : ""}`
-    : "no-model";
+    : "";
   const left = stats.join(" ");
-  if (visibleWidth(left) + 2 >= width) return truncateToWidth(left, width, "…");
+  if (!left) return truncateToWidth(model, width, "…");
+  if (!model || visibleWidth(left) + 2 >= width) return truncateToWidth(left, width, "…");
   const availableRight = width - visibleWidth(left) - 2;
   const right = truncateToWidth(model, availableRight, "");
   const padding = " ".repeat(Math.max(2, width - visibleWidth(left) - visibleWidth(right)));

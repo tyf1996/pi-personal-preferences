@@ -84,7 +84,7 @@ export function parsePrefCommand(input: string): PrefCommand {
     };
   }
 
-  throw new Error(`unknown /pref action: ${action}`);
+  throw new Error(`unknown /pref action: ${action}；请打开 /pref 主菜单`);
 }
 
 export const preferenceCommandNames = ["remember", "feedback"] as const;

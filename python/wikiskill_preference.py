@@ -37,10 +37,12 @@ from wikiskill_preference_core.storage import (  # noqa: E402
     PreferenceStore,
     checked_id,
     checked_text,
+    digest,
     new_id,
     stable_json,
     utc_now,
     validate_evidence,
+    validate_extraction,
     validate_model,
     validate_proposed_rules,
     validate_turn,
@@ -115,16 +117,17 @@ def _mutate_groups(
 def _status(store: PreferenceStore) -> dict[str, Any]:
     groups = store.groups()
     learning = store.learning()
-    pending = sum(item.get("status") in {"saved", "pending_group", "failed"} for item in learning["feedback"])
-    proposals = sum(item.get("status") == "pending" for item in learning["proposals"])
+    pending = _pending_list(store)
     return {
         "ok": True,
         "enabled": store.enabled(),
         "groups": len(groups["groups"]),
         "rules": sum(len([rule for rule in group["rules"] if rule["enabled"]]) for group in groups["groups"]),
         "saved_feedback_count": len(learning["feedback"]),
-        "pending_feedback_count": pending,
-        "pending_proposal_count": proposals,
+        "pending_feedback_count": len(pending["feedback"]),
+        "pending_proposal_count": len(pending["proposals"]),
+        "pending_evolution_count": len(pending["evolution_groups"]),
+        "actionable_count": len(pending["feedback"]) + len(pending["proposals"]) + len(pending["evolution_groups"]),
         "sync_state": sync_state(store.repo),
     }
 
@@ -291,6 +294,7 @@ def _feedback_create(store: PreferenceStore, value: dict[str, Any]) -> dict[str,
         "status": "saved",
         "evidence_id": None,
         "error": None,
+        "extraction": None,
     }
     with store.locked():
         learning = store.learning()
@@ -299,44 +303,96 @@ def _feedback_create(store: PreferenceStore, value: dict[str, Any]) -> dict[str,
     return {"ok": True, "feedback": feedback}
 
 
-def _feedback_pending_group(store: PreferenceStore, value: dict[str, Any]) -> dict[str, Any]:
-    data = _strict(value, {"feedback_id"}, {"feedback_id"}, "feedback-pending-group")
+def _quote_sources(feedback: dict[str, Any], evidence: dict[str, Any] | None) -> list[dict[str, str]]:
+    if evidence is None:
+        return []
+    result = []
+    for quote in evidence["supporting_quotes"]:
+        in_user = any(quote in turn["user"] for turn in feedback["selected_turns"])
+        in_assistant = any(quote in turn["assistant"] for turn in feedback["selected_turns"])
+        role = "both" if in_user and in_assistant else "user" if in_user else "assistant" if in_assistant else "unknown"
+        result.append({"text": quote, "role": role})
+    return result
+
+
+def _validated_extraction(store: PreferenceStore, feedback: dict[str, Any], value: Any) -> dict[str, Any]:
+    extraction = validate_extraction(value)
+    for source in _quote_sources(feedback, extraction["evidence"]):
+        if source["role"] == "unknown":
+            raise PreferenceValidationError("extraction supporting_quotes must each come from one selected user or assistant message")
+    return extraction
+
+
+def _extraction_group(store: PreferenceStore, feedback: dict[str, Any]) -> str | None:
+    names = {item["name"] for item in store.groups()["groups"]}
+    explicit = feedback.get("group_name")
+    if explicit is not None:
+        return explicit if explicit in names else None
+    extraction = feedback.get("extraction")
+    if extraction and extraction["group"]["certain"] and extraction["group"]["name"] in names:
+        return extraction["group"]["name"]
+    return None
+
+
+def _feedback_extracted(store: PreferenceStore, value: dict[str, Any]) -> dict[str, Any]:
+    data = _strict(value, {"feedback_id", "extraction", "model"}, {"feedback_id", "extraction", "model"}, "feedback-extracted")
+    model = validate_model(data["model"])
     with store.locked():
         learning = store.learning()
         feedback = store.require_feedback(learning, data["feedback_id"])
-        feedback["status"] = "pending_group"
-        feedback["error"] = None
-        store.write_learning(learning)
-    return {"ok": True, "feedback_id": feedback["id"]}
+        if feedback["status"] != "organized":
+            changed = False
+            if feedback.get("extraction") is None:
+                feedback["extraction"] = _validated_extraction(store, feedback, data["extraction"])
+                feedback["model"] = model
+                changed = True
+            next_status = "saved" if _extraction_group(store, feedback) is not None else "pending_group"
+            if feedback["status"] != next_status or feedback["error"] is not None:
+                feedback["status"] = next_status
+                feedback["error"] = None
+                changed = True
+            if changed:
+                store.write_learning(learning)
+        return {
+            "ok": True,
+            "feedback": feedback,
+            "needs_group": feedback["status"] != "organized" and _extraction_group(store, feedback) is None,
+        }
 
 
 def _feedback_fail(store: PreferenceStore, value: dict[str, Any]) -> dict[str, Any]:
-    data = _strict(value, {"feedback_id"}, {"feedback_id"}, "feedback-fail")
+    data = _strict(value, {"feedback_id"}, {"feedback_id", "error"}, "feedback-fail")
+    error = checked_text(data.get("error", "模型整理失败"), "feedback.error", maximum=500)
     with store.locked():
         learning = store.learning()
         feedback = store.require_feedback(learning, data["feedback_id"])
-        feedback["status"] = "failed"
-        feedback["error"] = "模型整理失败"
-        store.write_learning(learning)
-    return {"ok": True, "feedback_id": feedback["id"]}
+        if feedback["status"] != "organized":
+            feedback["status"] = "failed"
+            feedback["error"] = error
+            store.write_learning(learning)
+    return {"ok": True, "feedback": feedback}
 
 
 def _feedback_complete(store: PreferenceStore, value: dict[str, Any]) -> dict[str, Any]:
-    data = _strict(value, {"feedback_id", "group", "evidence"}, {"feedback_id", "group", "evidence"}, "feedback-complete")
+    data = _strict(value, {"feedback_id", "group"}, {"feedback_id", "group"}, "feedback-complete")
     group_name = checked_text(data["group"], "group", maximum=128)
-    evidence_content = validate_evidence(data["evidence"])
     with store.locked():
-        group = store.group_by_name(group_name)
         learning = store.learning()
         feedback = store.require_feedback(learning, data["feedback_id"])
-        selected_source = "\n".join(
-            f"{turn['user']}\n{turn['assistant']}" for turn in feedback["selected_turns"]
-        )
-        if any(quote not in selected_source for quote in evidence_content["supporting_quotes"]):
-            raise PreferenceValidationError("evidence supporting_quotes must come from the selected conversation")
         if feedback.get("evidence_id"):
             existing = next(item for item in learning["evidence"] if item.get("id") == feedback["evidence_id"])
             return {"ok": True, "feedback": feedback, "evidence": existing, "duplicate": True}
+        extraction = feedback.get("extraction")
+        if extraction is None:
+            raise PreferenceValidationError("feedback has no saved extraction")
+        group = store.group_by_name(group_name)
+        explicit = feedback.get("group_name")
+        current_names = {item["name"] for item in store.groups()["groups"]}
+        if explicit is not None and explicit in current_names and explicit != group["name"]:
+            raise PreferenceValidationError("feedback explicit group is still valid and cannot be replaced")
+        evidence_content = extraction["evidence"]
+        if any(source["role"] == "unknown" for source in _quote_sources(feedback, evidence_content)):
+            raise PreferenceValidationError("evidence supporting_quotes must each come from one selected user or assistant message")
         evidence = {
             "id": new_id("evidence-"),
             "created_at": utc_now(),
@@ -354,9 +410,182 @@ def _feedback_complete(store: PreferenceStore, value: dict[str, Any]) -> dict[st
     return {"ok": True, "feedback": feedback, "evidence": evidence, "duplicate": False}
 
 
+def _feedback_get(store: PreferenceStore, value: dict[str, Any]) -> dict[str, Any]:
+    data = _strict(value, {"feedback_id"}, {"feedback_id"}, "feedback-get")
+    learning = store.learning()
+    feedback = store.require_feedback(learning, data["feedback_id"])
+    evidence = next((item for item in learning["evidence"] if item.get("id") == feedback.get("evidence_id")), None)
+    projected = evidence or (feedback.get("extraction") or {}).get("evidence")
+    return {"ok": True, "feedback": feedback, "evidence": projected, "quote_sources": _quote_sources(feedback, projected)}
+
+
 def _feedback_list(store: PreferenceStore) -> dict[str, Any]:
     learning = store.learning()
-    return {"ok": True, "feedback": list(reversed(learning["feedback"][-100:]))}
+    return {"ok": True, "feedback": list(reversed(learning["feedback"]))}
+
+
+def _feedback_evidence(learning: dict[str, Any], feedback: dict[str, Any]) -> dict[str, Any] | None:
+    return next((item for item in learning["evidence"] if item.get("id") == feedback.get("evidence_id")), None)
+
+
+def _reprocess_digest(feedback: dict[str, Any], evidence: dict[str, Any] | None) -> str:
+    return digest({"feedback": feedback, "evidence": evidence})
+
+
+def _group_snapshot(group: dict[str, Any], store: PreferenceStore) -> dict[str, Any]:
+    return {
+        "id": group["id"],
+        "name": group["name"],
+        "description": group["description"],
+        "base_digest": store.group_digest(group),
+    }
+
+
+def _feedback_reprocess(store: PreferenceStore, value: dict[str, Any]) -> dict[str, Any]:
+    action = checked_text(value.get("action"), "action", maximum=32)
+    if action == "prepare":
+        data = _strict(value, {"action", "feedback_id"}, {"action", "feedback_id"}, "feedback-reprocess prepare")
+        with store.locked():
+            learning = store.learning()
+            feedback = store.require_feedback(learning, data["feedback_id"])
+            evidence = _feedback_evidence(learning, feedback)
+            document = store.groups()
+            groups_by_id = {item["id"]: item for item in document["groups"]}
+            groups_by_name = {item["name"]: item for item in document["groups"]}
+            original_group = groups_by_id.get(evidence["group_id"]) if evidence is not None else groups_by_name.get(feedback.get("group_name"))
+            return {
+                "ok": True,
+                "feedback": feedback,
+                "evidence": evidence,
+                "group": None if original_group is None else _group_snapshot(original_group, store),
+                "groups": [_group_snapshot(group, store) for group in document["groups"]],
+                "expected_digest": _reprocess_digest(feedback, evidence),
+            }
+    if action != "apply":
+        raise PreferenceValidationError(f"unsupported feedback-reprocess action: {action}")
+    required = {"action", "feedback_id", "group_id", "expected_digest", "expected_group_digest", "extraction", "model"}
+    data = _strict(value, required, required, "feedback-reprocess apply")
+    feedback_id = checked_id(data["feedback_id"], "feedback_id")
+    group_id = checked_id(data["group_id"], "group_id")
+    expected_digest = checked_text(data["expected_digest"], "expected_digest", maximum=80)
+    expected_group_digest = checked_text(data["expected_group_digest"], "expected_group_digest", maximum=80)
+    extraction = validate_extraction(data["extraction"])
+    model = validate_model(data["model"])
+    with store.locked():
+        learning = store.learning()
+        feedback = store.require_feedback(learning, feedback_id)
+        evidence = _feedback_evidence(learning, feedback)
+        if _reprocess_digest(feedback, evidence) != expected_digest:
+            raise PreferenceValidationError("feedback or evidence changed before reprocess apply")
+        document = store.groups()
+        group = store.group_by_id(group_id, document)
+        if store.group_digest(group) != expected_group_digest:
+            raise PreferenceValidationError("preference group changed before reprocess apply")
+        groups_by_id = {item["id"]: item for item in document["groups"]}
+        groups_by_name = {item["name"]: item for item in document["groups"]}
+        fixed_group = groups_by_id.get(evidence["group_id"]) if evidence is not None else groups_by_name.get(feedback.get("group_name"))
+        if fixed_group is not None and fixed_group["id"] != group["id"]:
+            raise PreferenceValidationError("existing feedback group cannot be replaced")
+        had_original_group = evidence is not None or feedback.get("group_name") is not None
+        suggested_name = extraction["group"]["name"] if extraction["group"]["certain"] else None
+        suggested_group = groups_by_name.get(suggested_name)
+        if not had_original_group and suggested_group is not None and suggested_group["id"] != group["id"]:
+            raise PreferenceValidationError("certain model group must be used for ungrouped feedback")
+        if any(source["role"] == "unknown" for source in _quote_sources(feedback, extraction["evidence"])):
+            raise PreferenceValidationError("reprocessed supporting_quotes must each come from one selected user or assistant message")
+
+        evidence_content = extraction["evidence"]
+        changed = evidence is None or evidence["group_id"] != group["id"] or any(
+            evidence[key] != evidence_content[key]
+            for key in ("summary", "actual_behavior", "expected_behavior", "applicability", "supporting_quotes")
+        )
+        if evidence is None:
+            updated_evidence = {
+                "id": new_id("evidence-"),
+                "created_at": utc_now(),
+                "feedback_id": feedback["id"],
+                "group_id": group["id"],
+                "group_name": group["name"],
+                **evidence_content,
+            }
+            learning["evidence"].append(updated_evidence)
+        else:
+            updated_evidence = {
+                **evidence,
+                "group_id": group["id"],
+                "group_name": group["name"],
+                **evidence_content,
+            }
+            learning["evidence"] = [updated_evidence if item["id"] == evidence["id"] else item for item in learning["evidence"]]
+        updated_feedback = {
+            **feedback,
+            "model": model,
+            "group_name": group["name"],
+            "status": "organized",
+            "evidence_id": updated_evidence["id"],
+            "error": None,
+            "extraction": extraction,
+        }
+        learning["feedback"] = [updated_feedback if item["id"] == feedback["id"] else item for item in learning["feedback"]]
+        invalidated = 0
+        if changed:
+            for proposal in learning["proposals"]:
+                if proposal["status"] == "pending" and updated_evidence["id"] in proposal["evidence_ids"]:
+                    proposal["status"] = "stale"
+                    proposal["resolved_at"] = utc_now()
+                    invalidated += 1
+        store.write_learning(learning)
+    return {
+        "ok": True,
+        "feedback": updated_feedback,
+        "evidence": updated_evidence,
+        "invalidated_proposal_count": invalidated,
+    }
+
+
+def _pending_list(store: PreferenceStore) -> dict[str, Any]:
+    document = store.groups()
+    learning = store.learning()
+    groups_by_id = {item["id"]: item for item in document["groups"]}
+    valid_proposals = []
+    for proposal in reversed(learning["proposals"]):
+        if proposal["status"] != "pending":
+            continue
+        group = groups_by_id.get(proposal["group_id"])
+        if group is not None and store.group_digest(group) == proposal["base_digest"]:
+            valid_proposals.append(proposal)
+    evolution_groups = []
+    for group in document["groups"]:
+        reviewed = set(learning["reviewed_evidence"].get(group["id"], []))
+        new_count = sum(
+            item.get("group_id") == group["id"] and item["id"] not in reviewed
+            for item in learning["evidence"]
+        )
+        has_valid = any(item["group_id"] == group["id"] for item in valid_proposals)
+        if new_count >= 3 and not has_valid:
+            evolution_groups.append({"id": group["id"], "name": group["name"], "new_evidence_count": new_count})
+    return {
+        "ok": True,
+        "feedback": [item for item in reversed(learning["feedback"]) if item["status"] in {"saved", "pending_group", "failed"}],
+        "proposals": valid_proposals,
+        "evolution_groups": evolution_groups,
+    }
+
+
+def _project_evidence(learning: dict[str, Any], evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    feedback_by_id = {item["id"]: item for item in learning["feedback"]}
+    projected = []
+    for item in evidence:
+        feedback = feedback_by_id.get(item["feedback_id"])
+        projected.append({
+            **item,
+            "evaluation": None if feedback is None else {
+                "sentiment": feedback["sentiment"],
+                "reason": feedback["reason"],
+                "quote_sources": _quote_sources(feedback, item),
+            },
+        })
+    return projected
 
 
 def _prepare_evolution(store: PreferenceStore, value: dict[str, Any]) -> dict[str, Any]:
@@ -369,8 +598,7 @@ def _prepare_evolution(store: PreferenceStore, value: dict[str, Any]) -> dict[st
         evidence = [item for item in learning["evidence"] if item.get("group_id") == group["id"]]
         pending = store.pending_proposal(learning, group["id"])
         if pending is not None:
-            current_ids = {item["id"] for item in evidence}
-            if set(pending["evidence_ids"]) == current_ids:
+            if pending["base_digest"] == store.group_digest(group):
                 return {"ok": True, "trigger": False, "pending_proposal": pending}
             pending["status"] = "stale"
             pending["resolved_at"] = utc_now()
@@ -379,20 +607,24 @@ def _prepare_evolution(store: PreferenceStore, value: dict[str, Any]) -> dict[st
         new_ids = [item["id"] for item in evidence if item["id"] not in reviewed]
         if len(new_ids) < 3:
             return {"ok": True, "trigger": False, "new_evidence_count": len(new_ids), "threshold": 3}
+        projected_evidence = _project_evidence(learning, evidence)
         return {
             "ok": True,
             "trigger": True,
             "base_digest": store.group_digest(group),
             "group": group,
-            "evidence": evidence,
+            "evidence": projected_evidence,
+            "evidence_digest": digest(projected_evidence),
             "new_evidence_ids": new_ids,
         }
 
 
 def _save_evolution(store: PreferenceStore, value: dict[str, Any]) -> dict[str, Any]:
-    data = _strict(value, {"group_id", "base_digest", "evidence_ids", "proposed_rules", "rationale"}, {"group_id", "base_digest", "evidence_ids", "proposed_rules", "rationale"}, "save-evolution")
+    fields = {"group_id", "base_digest", "evidence_digest", "evidence_ids", "proposed_rules", "rationale"}
+    data = _strict(value, fields, fields, "save-evolution")
     group_id = checked_id(data["group_id"], "group_id")
     base_digest = checked_text(data["base_digest"], "base_digest", maximum=80)
+    evidence_digest = checked_text(data["evidence_digest"], "evidence_digest", maximum=80)
     if not isinstance(data["evidence_ids"], list) or not data["evidence_ids"]:
         raise PreferenceValidationError("evidence_ids must be a non-empty list")
     evidence_ids = [checked_id(item, "evidence_id") for item in data["evidence_ids"]]
@@ -403,9 +635,12 @@ def _save_evolution(store: PreferenceStore, value: dict[str, Any]) -> dict[str, 
         if store.group_digest(group) != base_digest:
             raise PreferenceValidationError("preference group changed while the model was running")
         learning = store.learning()
-        available = {item["id"] for item in learning["evidence"] if item.get("group_id") == group_id}
+        current_evidence = [item for item in learning["evidence"] if item.get("group_id") == group_id]
+        available = {item["id"] for item in current_evidence}
         if set(evidence_ids) != available:
             raise PreferenceValidationError("evolution must include all current group evidence")
+        if digest(_project_evidence(learning, current_evidence)) != evidence_digest:
+            raise PreferenceValidationError("evolution evidence changed while the model was running")
         if store.pending_proposal(learning, group_id) is not None:
             raise PreferenceValidationError("the group already has a pending rule proposal")
         proposal = {
@@ -506,14 +741,20 @@ def dispatch(args: argparse.Namespace, stdin_value: dict[str, Any] | None) -> di
         return _sync(store)
     if args.command == "feedback-create":
         return _feedback_create(store, stdin_value or {})
-    if args.command == "feedback-pending-group":
-        return _feedback_pending_group(store, stdin_value or {})
+    if args.command == "feedback-extracted":
+        return _feedback_extracted(store, stdin_value or {})
     if args.command == "feedback-fail":
         return _feedback_fail(store, stdin_value or {})
     if args.command == "feedback-complete":
         return _feedback_complete(store, stdin_value or {})
+    if args.command == "feedback-get":
+        return _feedback_get(store, stdin_value or {})
     if args.command == "feedback-list":
         return _feedback_list(store)
+    if args.command == "feedback-reprocess":
+        return _feedback_reprocess(store, stdin_value or {})
+    if args.command == "pending-list":
+        return _pending_list(store)
     if args.command == "prepare-evolution":
         return _prepare_evolution(store, stdin_value or {})
     if args.command == "save-evolution":
@@ -527,7 +768,7 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Pi personal preference backend")
     result.add_argument("command", choices=[
         "init", "status", "groups", "context", "remember", "manage-group", "set-activation", "sync",
-        "feedback-create", "feedback-pending-group", "feedback-fail", "feedback-complete", "feedback-list",
+        "feedback-create", "feedback-extracted", "feedback-fail", "feedback-complete", "feedback-get", "feedback-list", "feedback-reprocess", "pending-list",
         "prepare-evolution", "save-evolution", "resolve-evolution",
     ])
     result.add_argument("--stdin", action="store_true")
