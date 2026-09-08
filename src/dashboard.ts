@@ -34,6 +34,7 @@ export interface DashboardActions {
   evidence: (menu: MenuSession) => Promise<void>;
   reprocess: (menu: MenuSession) => Promise<boolean>;
   pending: (menu: MenuSession) => Promise<void>;
+  manualEvolution: (menu: MenuSession) => Promise<boolean>;
   sessionId: string;
 }
 
@@ -239,6 +240,7 @@ const mainMenuItems: MenuItem[] = [
   { value: "evidence", label: "反馈与证据" },
   { value: "reprocess", label: "重新整理反馈" },
   { value: "pending", label: "处理待办" },
+  { value: "manual-evolution", label: "手动演化规则" },
   { value: "remember", label: "记住一条规则" },
   { value: "groups", label: "管理组与规则" },
   { value: "directory-enable", label: "为当前目录启用组" },
@@ -266,7 +268,9 @@ export async function showPreferenceDashboard(
     else if (choice === "reprocess") {
       if (await actions.reprocess(menu)) return;
     } else if (choice === "pending") await actions.pending(menu);
-    else if (choice === "remember") {
+    else if (choice === "manual-evolution") {
+      if (await actions.manualEvolution(menu)) return;
+    } else if (choice === "remember") {
       const rule = (await ctx.ui.input("记住规则", "输入明确规则"))?.trim();
       if (rule) await actions.remember(rule);
     } else if (choice === "groups") await manageGroup(ctx, invoke, actions.sessionId, menu);

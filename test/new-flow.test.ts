@@ -9,6 +9,7 @@ import { initTheme } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import preferenceExtension from "../index.ts";
 import { PreferenceCliCleanupError, runPreferenceCli } from "../src/cli-client.ts";
+import { selectEvidence } from "../src/evidence-picker.ts";
 import { parsePrefCommand, preferenceCommandNames } from "../src/commands.ts";
 import { formatPreferenceSummary } from "../src/dashboard.ts";
 import {
@@ -254,10 +255,12 @@ function addCliEvidence(
 
 interface HarnessOptions {
   root?: string;
+  mode?: "tui" | "rpc";
   branch?: Json[];
   model?: Json | null;
   modelReply?: (prompt: string, call: number, request: Json) => ModelReply | Promise<ModelReply>;
   pickerInputs?: string[][];
+  evidenceInputs?: string[][];
   loaderInputs?: string[][];
   detailInputs?: string[][];
   selectReply?: (title: string, choices: string[]) => string | undefined;
@@ -291,6 +294,7 @@ function harness(t: test.TestContext, options: HarnessOptions = {}) {
   const renderedViews: string[][] = [];
   const customComponents: any[] = [];
   const pickerInputs = [...(options.pickerInputs ?? [])];
+  const evidenceInputs = [...(options.evidenceInputs ?? [])];
   const loaderInputs = [...(options.loaderInputs ?? [])];
   const detailInputs = [...(options.detailInputs ?? [])];
   const inputReplies = [...(options.inputReplies ?? [])];
@@ -305,7 +309,7 @@ function harness(t: test.TestContext, options: HarnessOptions = {}) {
   const branch = options.branch ?? completedBranch(1, "selected");
 
   const mainMenuChoices = [
-    "查看当前状态", "记录反馈", "反馈与证据", "重新整理反馈", "处理待办", "记住一条规则", "管理组与规则",
+    "查看当前状态", "记录反馈", "反馈与证据", "重新整理反馈", "处理待办", "手动演化规则", "记住一条规则", "管理组与规则",
     "为当前目录启用组", "为当前目录禁用组", "为当前会话启用组", "为当前会话禁用组", "同步正式规则",
   ];
 
@@ -358,6 +362,7 @@ function harness(t: test.TestContext, options: HarnessOptions = {}) {
           const initial = component.render?.(terminal.columns) ?? [];
           renderedViews.push(initial);
           const isPicker = initial.some((line: string) => line.includes("选择最近对话"));
+          const isEvidencePicker = initial.some((line: string) => line.includes("选择演化证据"));
           const isLoader = component?.constructor?.name === "BorderedLoader";
           const isMenu = initial.some((line: string) => line.includes("Right/Enter 进入") || line.includes("→ 进入"));
           if (isMenu) {
@@ -387,6 +392,8 @@ function harness(t: test.TestContext, options: HarnessOptions = {}) {
           } else {
             const inputs = isPicker
               ? pickerInputs.shift() ?? [" ", "\r"]
+              : isEvidencePicker
+                ? evidenceInputs.shift() ?? [" ", "\r"]
               : isLoader
                 ? loaderInputs.shift() ?? []
                 : detailInputs.shift() ?? ["\x1b"];
@@ -403,7 +410,7 @@ function harness(t: test.TestContext, options: HarnessOptions = {}) {
   };
 
   const ctx: Json = {
-    mode: "tui",
+    mode: options.mode ?? "tui",
     hasUI: true,
     cwd: "/tmp/pi-pref-project",
     ui,
@@ -533,6 +540,160 @@ test("command parser and branch picker keep the bounded real-conversation contra
   }) as any;
   assert.deepEqual(await selectConversationTurns(pickerCtx([" ", "\x1b[A", " ", "\x1b[B", " ", "\r"]), values), [values[0]]);
   assert.equal(await selectConversationTurns(pickerCtx(["\x1b"]), values), null);
+});
+
+test("U01 manual evolution is always visible and explains missing evidence in TUI and RPC", async (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  ok(root, ["remember", "--stdin"], { group: "global", rule: "formal rule is not evidence" });
+  const before = readFileSync(join(root, "local/learning.json"), "utf8");
+  const flow = harness(t, { root });
+  await flow.menu("手动演化规则");
+  assert.ok(flow.selects.some((item) => item.title === "个人偏好" && item.choices.includes("手动演化规则")));
+  assert.ok(flow.notices.some((item) => item.message.includes("没有已整理且归属有效组的证据") && item.message.includes("正式规则不等于证据")));
+  assert.equal(flow.modelCalls, 0);
+  assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), before);
+  assert.deepEqual([...preferenceCommandNames], ["remember", "feedback"]);
+
+  const rpc = harness(t, { root, mode: "rpc" });
+  await rpc.menu("手动演化规则");
+  assert.ok(rpc.notices.some((item) => item.message.includes("需要交互式 TUI")));
+  assert.equal(rpc.modelCalls, 0);
+  assert.equal(rpc.events.includes("custom"), false);
+});
+
+test("U02 manual evidence accepts one or historical selections while automatic thresholds stay unchanged", (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  ok(root, ["manage-group", "--stdin"], { action: "create", name: "coding", description: "coding" });
+  ok(root, ["manage-group", "--stdin"], { action: "create", name: "obsolete", description: "obsolete" });
+  ok(root, ["remember", "--stdin"], { group: "global", rule: "formal-only" });
+  const first = addCliEvidence(root, 1);
+  const second = addCliEvidence(root, 2);
+  const coding = addCliEvidence(root, 3, "assistant", "coding");
+  const orphan = addCliEvidence(root, 4, "assistant", "obsolete");
+  ok(root, ["manage-group", "--stdin"], { action: "delete", group: "obsolete" });
+  ok(root, ["feedback-create", "--stdin"], {
+    sentiment: "fix", reason: "pending extraction", selected_turns: [{ user: "pending", assistant: "pending assistant" }], model: null, group: null,
+  });
+  assert.equal(ok(root, ["prepare-evolution", "--stdin"], { group: "global" }).trigger, false);
+  addCliEvidence(root, 5);
+  assert.equal(ok(root, ["prepare-evolution", "--stdin"], { group: "global" }).trigger, true);
+  const groupRows = ok(root, ["groups"]).groups;
+  const globalId = groupRows.find((item: Json) => item.name === "global").id;
+  const codingId = groupRows.find((item: Json) => item.name === "coding").id;
+  const marked = learning(root);
+  marked.reviewed_evidence[globalId] = [marked.evidence.find((item: Json) => item.feedback_id === first.id).id];
+  writeFileSync(join(root, "local/learning.json"), `${JSON.stringify(marked)}\n`);
+  const firstEvidence = marked.evidence.find((item: Json) => item.feedback_id === first.id);
+  const secondEvidence = marked.evidence.find((item: Json) => item.feedback_id === second.id);
+  const codingEvidence = marked.evidence.find((item: Json) => item.feedback_id === coding.id);
+  const orphanEvidence = marked.evidence.find((item: Json) => item.feedback_id === orphan.id);
+  const before = readFileSync(join(root, "local/learning.json"), "utf8");
+
+  const listed = ok(root, ["manual-evolution", "--stdin"], { action: "list" });
+  assert.deepEqual(new Set(listed.groups.map((item: Json) => item.id)), new Set([globalId, codingId]));
+  assert.ok(listed.evidence.some((item: Json) => item.id === firstEvidence.id));
+  assert.ok(listed.evidence.some((item: Json) => item.id === codingEvidence.id));
+  assert.equal(listed.evidence.some((item: Json) => item.id === orphanEvidence.id), false);
+  assert.equal(listed.evidence.some((item: Json) => item.summary === "formal-only"), false);
+  assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), before);
+
+  assert.equal(ok(root, ["manual-evolution", "--stdin"], { action: "prepare", group_id: globalId, evidence_ids: [firstEvidence.id] }).evidence.length, 1);
+  const reordered = ok(root, ["manual-evolution", "--stdin"], { action: "prepare", group_id: globalId, evidence_ids: [secondEvidence.id, firstEvidence.id] });
+  assert.deepEqual(reordered.evidence.map((item: Json) => item.id), [firstEvidence.id, secondEvidence.id]);
+  assert.deepEqual(reordered.evidence_ids, reordered.evidence.map((item: Json) => item.id));
+  for (const evidenceIds of [[], ["unknown-evidence"], [firstEvidence.id, firstEvidence.id], [codingEvidence.id]]) {
+    assert.equal(cli(root, ["manual-evolution", "--stdin"], { action: "prepare", group_id: globalId, evidence_ids: evidenceIds }).ok, false);
+  }
+
+  const capacityRoot = temporaryRoot(t);
+  ok(capacityRoot, ["init"]);
+  const capacityFeedback = addCliEvidence(capacityRoot, 1);
+  const capacityLearning = learning(capacityRoot);
+  const baseEvidence = capacityLearning.evidence.find((item: Json) => item.feedback_id === capacityFeedback.id);
+  capacityLearning.evidence = Array.from({ length: 360 }, (_, index) => ({
+    ...baseEvidence,
+    id: index === 0 ? baseEvidence.id : `evidence-capacity-${index}`,
+    summary: "s".repeat(2000),
+    actual_behavior: "a".repeat(4000),
+    expected_behavior: "e".repeat(4000),
+    applicability: "p".repeat(2000),
+  }));
+  writeFileSync(join(capacityRoot, "local/learning.json"), `${JSON.stringify(capacityLearning)}\n`);
+  const capacityGroup = ok(capacityRoot, ["groups"]).groups.find((item: Json) => item.name === "global");
+  const capacityResult = cli(capacityRoot, ["manual-evolution", "--stdin"], {
+    action: "prepare", group_id: capacityGroup.id, evidence_ids: capacityLearning.evidence.map((item: Json) => item.id),
+  });
+  assert.equal(capacityResult.ok, false);
+  assert.match(capacityResult.error.message, /4 MiB/);
+});
+
+test("U03 evidence picker uses real multiselect keys, scrolls, and cancellation returns to the remembered menu", async (t) => {
+  const items = Array.from({ length: 30 }, (_, index) => ({
+    id: `evidence-${index}`,
+    createdAt: index === 2 ? "2026-01-03\t12:00" : `2026-01-${String(index + 1).padStart(2, "0")}`,
+    summary: index === 0
+      ? "LF\n摘要"
+      : index === 1 ? "CRLF\r\n摘要" : index === 2 ? "TAB\t摘要" : index === 29
+        ? `末项 ${"很长的中文摘要".repeat(30)}`
+        : `summary ${index} ${"很长的中文摘要".repeat(20)}`,
+  }));
+  const originalItems = JSON.parse(JSON.stringify(items));
+  const picker = async (keys: string[]) => {
+    const renders: string[][] = [];
+    const result = selectEvidence({
+      mode: "tui",
+      ui: { custom(factory: Function) {
+        return new Promise((resolvePromise) => {
+          const component = factory({ requestRender() {}, terminal: { rows: 24 } }, themeForTest(), {}, resolvePromise);
+          renders.push(component.render(40));
+          for (const key of keys) {
+            component.handleInput(key);
+            renders.push(component.render(40));
+          }
+        });
+      } },
+    } as any, items, new AbortController().signal);
+    return { value: await result, renders };
+  };
+  const emptyResult = await picker(["\r"]);
+  assert.deepEqual(emptyResult.value, []);
+  const initialText = emptyResult.renders[0]!.join("\n");
+  assert.match(initialText, /LF 摘要/);
+  assert.match(initialText, /CRLF 摘要/);
+  assert.match(initialText, /2026-01-03 12:00 · TAB 摘要/);
+  const selected = await picker([...Array(29).fill("\x1b[B"), " ", "\r"]);
+  assert.deepEqual(selected.value, ["evidence-29"]);
+  assert.ok(selected.renders.at(-1)!.some((line) => line.includes("末项")));
+  for (const view of [...emptyResult.renders, ...selected.renders]) {
+    assert.ok(view.length <= 24);
+    assert.ok(view.every((line) => !/[\r\n]/u.test(line)));
+    assert.ok(view.every((line) => visibleWidth(line) <= 40));
+  }
+  for (const key of ["\x1b[D", "\x1b", "\x03"]) assert.equal((await picker([key])).value, null);
+  assert.deepEqual(items, originalItems);
+
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  addCliEvidence(root, 1);
+  const flow = harness(t, {
+    root,
+    evidenceInputs: [["\x1b[D"]],
+    menuInputs: [
+      { title: "个人偏好", keys: [...Array(5).fill("\x1b[B"), "\x1b[C"] },
+      { title: "手动演化规则", keys: ["\x1b[C"] },
+      { title: "个人偏好", keys: ["\x1b[D"] },
+    ],
+  });
+  await flow.pref("");
+  assert.equal(flow.modelCalls, 0);
+  assert.ok(flow.renderedViews.some((view) => view.some((line) => line.includes("→ 手动演化规则"))));
+
+  const empty = harness(t, { root, evidenceInputs: [["\r"]] });
+  await empty.menu("手动演化规则");
+  assert.equal(empty.modelCalls, 0);
+  assert.ok(empty.notices.some((item) => item.message.includes("未选择任何证据")));
 });
 
 test("T01 collector preserves message and assistant block order without timestamp sorting", () => {
@@ -734,6 +895,391 @@ test("T05 feedback handler saves and models the exact ordered snapshot without r
   gate.resolve(extraction("HANDLER-PATCH", { summary: "ordered handler evidence" }));
   await waitFor(() => learning(flow.root).feedback[0].status === "organized", "ordered handler organization");
   assert.deepEqual(learning(flow.root).feedback[0].selected_turns, savedTurns);
+});
+
+test("U04/U05 manual handler sends the exact selected projection and keeps data unchanged before apply", async (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  ok(root, ["remember", "--stdin"], { group: "global", rule: "keep unrelated rule" });
+  ok(root, ["manage-group", "--stdin"], { action: "create", name: "coding", description: "coding" });
+  const first = addCliEvidence(root, 1);
+  const second = addCliEvidence(root, 2);
+  addCliEvidence(root, 3);
+  addCliEvidence(root, 4, "assistant", "coding");
+  const document = learning(root);
+  const firstEvidence = document.evidence.find((item: Json) => item.feedback_id === first.id);
+  const secondEvidence = document.evidence.find((item: Json) => item.feedback_id === second.id);
+  document.evidence[0].summary = "SELECTED-EVIDENCE-ONE";
+  document.evidence[1].summary = "SELECTED-EVIDENCE-TWO";
+  document.evidence[2].summary = "UNSELECTED-SAME-GROUP";
+  document.evidence[3].summary = "OTHER-GROUP-EVIDENCE";
+  writeFileSync(join(root, "local/learning.json"), `${JSON.stringify(document)}\n`);
+  const globalId = ok(root, ["groups"]).groups.find((item: Json) => item.name === "global").id;
+  const expected = ok(root, ["manual-evolution", "--stdin"], {
+    action: "prepare", group_id: globalId, evidence_ids: [firstEvidence.id, secondEvidence.id],
+  });
+  const gate = deferred<ModelReply>();
+  const flow = harness(t, {
+    root,
+    evidenceInputs: [[" ", "\x1b[B", " ", "\r"]],
+    detailInputs: [["r"]],
+    modelReply: () => gate.promise,
+  });
+  const beforeLearning = readFileSync(join(root, "local/learning.json"), "utf8");
+  const beforeGroups = readFileSync(join(root, "repo/groups.json"), "utf8");
+  let settled = false;
+  const running = flow.menu("手动演化规则").then(() => { settled = true; });
+  await waitFor(() => flow.modelCalls === 1, "manual evolution model");
+  assert.equal(settled, false);
+  assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), beforeLearning);
+  assert.equal(readFileSync(join(root, "repo/groups.json"), "utf8"), beforeGroups);
+  const input = JSON.parse(flow.prompts[0]!.split("\n\n").at(-1)!);
+  assert.deepEqual(input, { group: expected.group, selected_evidence: expected.evidence });
+  assert.match(flow.prompts[0]!, /本次主动选择的证据|未选证据缺席不表示其不存在|完整建议规则/);
+  assert.doesNotMatch(flow.prompts[0]!, /UNSELECTED-SAME-GROUP|OTHER-GROUP-EVIDENCE|selected_turns|"events"|RAW-/);
+  assert.equal(flow.modelRequests[0].request.reasoning, "high");
+  assert.match(flow.renderedViews.flat().join("\n"), /规则演化中，Esc 取消/);
+  gate.resolve({ proposed_rules: ["keep unrelated rule", "manual suggestion"], rationale: "selected rationale" });
+  await running;
+  assert.equal(flow.modelCalls, 1);
+  assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), beforeLearning);
+  assert.equal(readFileSync(join(root, "repo/groups.json"), "utf8"), beforeGroups);
+  const preview = flow.renderedViews.flat().join("\n");
+  assert.match(preview, /目标组：global|本次证据：2 条|SELECTED-EVIDENCE-ONE|selected rationale|keep unrelated rule|manual suggestion|\+ manual suggestion/);
+});
+
+test("U05 explicit A applies a full manual rule list while cancel and invalid output remain zero-write", async (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  ok(root, ["remember", "--stdin"], { group: "global", rule: "existing manual base" });
+  addCliEvidence(root, 1);
+  const beforeLearning = readFileSync(join(root, "local/learning.json"), "utf8");
+  const beforeGroups = readFileSync(join(root, "repo/groups.json"), "utf8");
+
+  const invalid = harness(t, { root, modelReply: () => "not-json" });
+  await invalid.menu("手动演化规则");
+  assert.equal(invalid.modelCalls, 1);
+  assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), beforeLearning);
+  assert.equal(readFileSync(join(root, "repo/groups.json"), "utf8"), beforeGroups);
+
+  const right = harness(t, {
+    root,
+    detailInputs: [["\x1b[C", "\x1b[D"]],
+    modelReply: () => ({ proposed_rules: ["existing manual base", "right must not apply"], rationale: "right ignored" }),
+  });
+  await right.menu("手动演化规则");
+  assert.equal(readFileSync(join(root, "repo/groups.json"), "utf8"), beforeGroups);
+
+  const headBefore = spawnSync("git", ["-C", join(root, "repo"), "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+  const applied = harness(t, {
+    root,
+    detailInputs: [[...Array(30).fill("\x1b[6~"), "a"]],
+    modelReply: () => ({
+      proposed_rules: ["existing manual base", `manual long rule ${"x".repeat(300)} RULE-TAIL`],
+      rationale: `${"reason ".repeat(150)}RATIONALE-TAIL`,
+    }),
+  });
+  await applied.menu("手动演化规则");
+  const headAfter = spawnSync("git", ["-C", join(root, "repo"), "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+  assert.notEqual(headAfter, headBefore);
+  assert.deepEqual(groups(root).groups[0].rules.map((item: Json) => item.text), ["existing manual base", `manual long rule ${"x".repeat(300)} RULE-TAIL`]);
+  assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), beforeLearning);
+  assert.ok(applied.notices.some((item) => item.message.includes("已应用并提交 Git")));
+  assert.match(applied.renderedViews.flat().join("\n"), /RULE-TAIL|RATIONALE-TAIL/);
+
+  const capacityRoot = temporaryRoot(t);
+  ok(capacityRoot, ["init"]);
+  addCliEvidence(capacityRoot, 1);
+  const wrapper = join(capacityRoot, "manual-capacity.py");
+  writeFileSync(wrapper, [
+    "import json, os, subprocess, sys",
+    `real_cli = ${JSON.stringify(cliPath)}`,
+    "payload = sys.stdin.buffer.read()",
+    "result = subprocess.run([sys.executable, real_cli, *sys.argv[1:]], input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE)",
+    "if sys.argv[1] == 'manual-evolution' and b'\"action\":\"prepare\"' in payload and result.returncode == 0:",
+    "    value = json.loads(result.stdout)",
+    "    value['evidence'][0]['padding'] = 'x' * (4 * 1024 * 1024)",
+    "    os.write(1, json.dumps(value).encode())",
+    "else:",
+    "    os.write(1, result.stdout)",
+    "os.write(2, result.stderr)",
+    "raise SystemExit(result.returncode)",
+  ].join("\n"));
+  const capacityBefore = readFileSync(join(capacityRoot, "local/learning.json"), "utf8");
+  const capacity = harness(t, { root: capacityRoot, preferenceCli: wrapper });
+  await capacity.menu("手动演化规则");
+  assert.equal(capacity.modelCalls, 0);
+  assert.ok(capacity.notices.some((item) => item.message.includes("超过") && item.message.includes("没有内容被裁剪或发送")));
+  assert.equal(readFileSync(join(capacityRoot, "local/learning.json"), "utf8"), capacityBefore);
+});
+
+test("U06 manual apply preserves IDs, disabled rules, other data, and no-change revisions", (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  ok(root, ["manage-group", "--stdin"], { action: "create", name: "coding", description: "coding" });
+  ok(root, ["remember", "--stdin"], { group: "global", rule: "retained active" });
+  ok(root, ["remember", "--stdin"], { group: "global", rule: "retained disabled" });
+  ok(root, ["remember", "--stdin"], { group: "coding", rule: "other group rule" });
+  const groupsPath = join(root, "repo/groups.json");
+  const fixtureGroups = groups(root);
+  const globalFixture = fixtureGroups.groups.find((item: Json) => item.name === "global");
+  const retainedId = globalFixture.rules.find((item: Json) => item.text === "retained active").id;
+  const disabledBefore = { ...globalFixture.rules.find((item: Json) => item.text === "retained disabled"), enabled: false };
+  globalFixture.rules = globalFixture.rules.map((item: Json) => item.text === "retained disabled" ? disabledBefore : item);
+  writeFileSync(groupsPath, `${JSON.stringify(fixtureGroups)}\n`);
+  spawnSync("git", ["-C", join(root, "repo"), "add", "groups.json"]);
+  const fixtureCommit = spawnSync("git", ["-C", join(root, "repo"), "commit", "-m", "fixture: disable rule"], { encoding: "utf8" });
+  assert.equal(fixtureCommit.status, 0, fixtureCommit.stderr);
+  const feedback = addCliEvidence(root, 1);
+  const learningDoc = learning(root);
+  const evidence = learningDoc.evidence.find((item: Json) => item.feedback_id === feedback.id);
+  learningDoc.reviewed_evidence[globalFixture.id] = [evidence.id];
+  writeFileSync(join(root, "local/learning.json"), `${JSON.stringify(learningDoc)}\n`);
+  const beforeLearning = readFileSync(join(root, "local/learning.json"), "utf8");
+  const codingBefore = groups(root).groups.find((item: Json) => item.name === "coding");
+
+  const prepared = ok(root, ["manual-evolution", "--stdin"], { action: "prepare", group_id: globalFixture.id, evidence_ids: [evidence.id] });
+  const applied = ok(root, ["manual-evolution", "--stdin"], {
+    action: "apply", group_id: globalFixture.id, evidence_ids: prepared.evidence_ids,
+    base_digest: prepared.base_digest, evidence_digest: prepared.evidence_digest,
+    proposed_rules: ["retained active", "manual added"], rationale: "manual selected evidence",
+  });
+  assert.equal(applied.changed, true);
+  assert.ok(applied.commit);
+  const after = groups(root);
+  const globalAfter = after.groups.find((item: Json) => item.name === "global");
+  assert.equal(globalAfter.rules.find((item: Json) => item.text === "retained active").id, retainedId);
+  assert.deepEqual(globalAfter.rules.find((item: Json) => item.text === "retained disabled"), disabledBefore);
+  assert.deepEqual(after.groups.find((item: Json) => item.name === "coding"), codingBefore);
+  assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), beforeLearning);
+
+  const revision = globalAfter.revision;
+  const head = spawnSync("git", ["-C", join(root, "repo"), "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+  const repeated = ok(root, ["manual-evolution", "--stdin"], { action: "prepare", group_id: globalFixture.id, evidence_ids: [evidence.id] });
+  const unchanged = ok(root, ["manual-evolution", "--stdin"], {
+    action: "apply", group_id: globalFixture.id, evidence_ids: repeated.evidence_ids,
+    base_digest: repeated.base_digest, evidence_digest: repeated.evidence_digest,
+    proposed_rules: ["retained active", "manual added"], rationale: "same result",
+  });
+  assert.equal(unchanged.changed, false);
+  assert.equal(unchanged.commit, null);
+  assert.equal(groups(root).groups.find((item: Json) => item.name === "global").revision, revision);
+  assert.equal(spawnSync("git", ["-C", join(root, "repo"), "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim(), head);
+  assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), beforeLearning);
+});
+
+test("U07 manual snapshots reject selected changes and preserve automatic candidate recovery branches", (t) => {
+  const candidateRoot = temporaryRoot(t);
+  ok(candidateRoot, ["init"]);
+  const candidateFeedback = [1, 2, 3].map((index) => addCliEvidence(candidateRoot, index));
+  const candidateLearning = learning(candidateRoot);
+  const candidateEvidence = candidateFeedback.map((feedback) => candidateLearning.evidence.find((item: Json) => item.feedback_id === feedback.id));
+  const auto = ok(candidateRoot, ["prepare-evolution", "--stdin"], { group: "global" });
+  const proposal = ok(candidateRoot, ["save-evolution", "--stdin"], {
+    group_id: auto.group.id, base_digest: auto.base_digest, evidence_digest: auto.evidence_digest,
+    evidence_ids: auto.evidence.map((item: Json) => item.id), proposed_rules: ["manual target"], rationale: "same automatic suggestion",
+  }).proposal;
+  const manual = ok(candidateRoot, ["manual-evolution", "--stdin"], {
+    action: "prepare", group_id: auto.group.id, evidence_ids: [candidateEvidence[0].id],
+  });
+  const learningBeforeManual = readFileSync(join(candidateRoot, "local/learning.json"), "utf8");
+  ok(candidateRoot, ["manual-evolution", "--stdin"], {
+    action: "apply", group_id: auto.group.id, evidence_ids: manual.evidence_ids,
+    base_digest: manual.base_digest, evidence_digest: manual.evidence_digest,
+    proposed_rules: ["manual target"], rationale: "manual apply",
+  });
+  assert.equal(readFileSync(join(candidateRoot, "local/learning.json"), "utf8"), learningBeforeManual);
+  assert.equal(ok(candidateRoot, ["pending-list"]).proposals.some((item: Json) => item.id === proposal.id), false);
+  const recovered = ok(candidateRoot, ["resolve-evolution", "--stdin"], { proposal_id: proposal.id, decision: "apply" });
+  assert.equal(recovered.proposal.status, "applied");
+  assert.deepEqual(learning(candidateRoot).reviewed_evidence[auto.group.id], proposal.evidence_ids);
+  assert.deepEqual(groups(candidateRoot).groups[0].rules.map((item: Json) => item.text), ["manual target"]);
+
+  const differentRoot = temporaryRoot(t);
+  ok(differentRoot, ["init"]);
+  for (let index = 1; index <= 3; index += 1) addCliEvidence(differentRoot, index);
+  const differentAuto = ok(differentRoot, ["prepare-evolution", "--stdin"], { group: "global" });
+  const differentProposal = ok(differentRoot, ["save-evolution", "--stdin"], {
+    group_id: differentAuto.group.id, base_digest: differentAuto.base_digest, evidence_digest: differentAuto.evidence_digest,
+    evidence_ids: differentAuto.evidence.map((item: Json) => item.id), proposed_rules: ["different automatic"], rationale: "different",
+  }).proposal;
+  const differentManual = ok(differentRoot, ["manual-evolution", "--stdin"], {
+    action: "prepare", group_id: differentAuto.group.id, evidence_ids: [differentAuto.evidence[0].id],
+  });
+  ok(differentRoot, ["manual-evolution", "--stdin"], {
+    action: "apply", group_id: differentAuto.group.id, evidence_ids: differentManual.evidence_ids,
+    base_digest: differentManual.base_digest, evidence_digest: differentManual.evidence_digest,
+    proposed_rules: ["manual wins"], rationale: "manual",
+  });
+  assert.equal(cli(differentRoot, ["resolve-evolution", "--stdin"], { proposal_id: differentProposal.id, decision: "apply" }).ok, false);
+  assert.equal(learning(differentRoot).proposals.find((item: Json) => item.id === differentProposal.id).status, "stale");
+  assert.deepEqual(groups(differentRoot).groups[0].rules.map((item: Json) => item.text), ["manual wins"]);
+  assert.equal(cli(differentRoot, ["save-evolution", "--stdin"], {
+    group_id: differentAuto.group.id, base_digest: differentAuto.base_digest, evidence_digest: differentAuto.evidence_digest,
+    evidence_ids: differentAuto.evidence.map((item: Json) => item.id), proposed_rules: ["late automatic"], rationale: "late",
+  }).ok, false);
+
+  const conflictRoot = temporaryRoot(t);
+  ok(conflictRoot, ["init"]);
+  ok(conflictRoot, ["manage-group", "--stdin"], { action: "create", name: "other", description: "other" });
+  const selectedFeedback = addCliEvidence(conflictRoot, 1);
+  const unselectedFeedback = addCliEvidence(conflictRoot, 2);
+  const conflictLearning = learning(conflictRoot);
+  const selectedEvidence = conflictLearning.evidence.find((item: Json) => item.feedback_id === selectedFeedback.id);
+  const unselectedEvidence = conflictLearning.evidence.find((item: Json) => item.feedback_id === unselectedFeedback.id);
+  const conflictGroup = ok(conflictRoot, ["groups"]).groups.find((item: Json) => item.name === "global");
+  const selectedPrepared = ok(conflictRoot, ["manual-evolution", "--stdin"], {
+    action: "prepare", group_id: conflictGroup.id, evidence_ids: [selectedEvidence.id],
+  });
+  selectedEvidence.summary = "externally changed selected evidence";
+  selectedEvidence.group_id = ok(conflictRoot, ["groups"]).groups.find((item: Json) => item.name === "other").id;
+  conflictLearning.feedback.find((item: Json) => item.id === selectedFeedback.id).reason = "externally changed reason";
+  writeFileSync(join(conflictRoot, "local/learning.json"), `${JSON.stringify(conflictLearning)}\n`);
+  assert.equal(cli(conflictRoot, ["manual-evolution", "--stdin"], {
+    action: "apply", group_id: conflictGroup.id, evidence_ids: selectedPrepared.evidence_ids,
+    base_digest: selectedPrepared.base_digest, evidence_digest: selectedPrepared.evidence_digest,
+    proposed_rules: ["must not apply"], rationale: "conflict",
+  }).ok, false);
+  assert.equal(groups(conflictRoot).groups.find((item: Json) => item.name === "global").rules.length, 0);
+
+  selectedEvidence.summary = "evidence 1";
+  selectedEvidence.group_id = conflictGroup.id;
+  conflictLearning.feedback.find((item: Json) => item.id === selectedFeedback.id).reason = "original reason 1";
+  writeFileSync(join(conflictRoot, "local/learning.json"), `${JSON.stringify(conflictLearning)}\n`);
+  const unselectedPrepared = ok(conflictRoot, ["manual-evolution", "--stdin"], {
+    action: "prepare", group_id: conflictGroup.id, evidence_ids: [selectedEvidence.id],
+  });
+  unselectedEvidence.summary = "changed but unselected";
+  writeFileSync(join(conflictRoot, "local/learning.json"), `${JSON.stringify(conflictLearning)}\n`);
+  assert.equal(ok(conflictRoot, ["manual-evolution", "--stdin"], {
+    action: "apply", group_id: conflictGroup.id, evidence_ids: unselectedPrepared.evidence_ids,
+    base_digest: unselectedPrepared.base_digest, evidence_digest: unselectedPrepared.evidence_digest,
+    proposed_rules: ["unselected change allowed"], rationale: "allowed",
+  }).changed, true);
+
+  const groupPrepared = ok(conflictRoot, ["manual-evolution", "--stdin"], {
+    action: "prepare", group_id: conflictGroup.id, evidence_ids: [selectedEvidence.id],
+  });
+  ok(conflictRoot, ["remember", "--stdin"], { group: "global", rule: "concurrent group change" });
+  assert.equal(cli(conflictRoot, ["manual-evolution", "--stdin"], {
+    action: "apply", group_id: conflictGroup.id, evidence_ids: groupPrepared.evidence_ids,
+    base_digest: groupPrepared.base_digest, evidence_digest: groupPrepared.evidence_digest,
+    proposed_rules: ["must not overwrite group"], rationale: "group conflict",
+  }).ok, false);
+});
+
+test("U08 manual prepare, picker, model, and preview obey shutdown while Git failures preserve rules", async (t) => {
+  const prepareRoot = temporaryRoot(t);
+  ok(prepareRoot, ["init"]);
+  addCliEvidence(prepareRoot, 1);
+  const wrapper = join(prepareRoot, "manual-prepare-delay.py");
+  const prepareStarted = join(prepareRoot, "manual-prepare-started");
+  writeFileSync(wrapper, [
+    "import os, signal, subprocess, sys, time",
+    `real_cli = ${JSON.stringify(cliPath)}`,
+    "if sys.argv[1] != 'manual-evolution':",
+    "    os.execv(sys.executable, [sys.executable, real_cli, *sys.argv[1:]])",
+    "payload = sys.stdin.buffer.read()",
+    "if b'\"action\":\"prepare\"' not in payload:",
+    "    result = subprocess.run([sys.executable, real_cli, *sys.argv[1:]], input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE)",
+    "    os.write(1, result.stdout)",
+    "    os.write(2, result.stderr)",
+    "    raise SystemExit(result.returncode)",
+    "signal.signal(signal.SIGTERM, lambda _signum, _frame: None)",
+    `open(${JSON.stringify(prepareStarted)}, 'w').close()`,
+    "while True:",
+    "    time.sleep(1)",
+  ].join("\n"));
+  const prepareFlow = harness(t, { root: prepareRoot, preferenceCli: wrapper });
+  const prepareBefore = readFileSync(join(prepareRoot, "local/learning.json"), "utf8");
+  const prepareRunning = prepareFlow.menu("手动演化规则");
+  await waitFor(() => existsSync(prepareStarted), "manual prepare start");
+  const prepareUi = prepareFlow.events.filter((item) => item === "custom").length;
+  const prepareNotices = prepareFlow.notices.length;
+  assert.equal(prepareFlow.modelCalls, 0);
+  await prepareFlow.shutdown("reload");
+  await prepareRunning;
+  assert.equal(prepareFlow.modelCalls, 0);
+  assert.equal(prepareFlow.events.filter((item) => item === "custom").length, prepareUi);
+  assert.equal(prepareFlow.notices.length, prepareNotices);
+  assert.equal(readFileSync(join(prepareRoot, "local/learning.json"), "utf8"), prepareBefore);
+
+  const pickerRoot = temporaryRoot(t);
+  ok(pickerRoot, ["init"]);
+  addCliEvidence(pickerRoot, 1);
+  const pickerFlow = harness(t, { root: pickerRoot, evidenceInputs: [[]] });
+  const pickerBeforeGroups = readFileSync(join(pickerRoot, "repo/groups.json"), "utf8");
+  const pickerRunning = pickerFlow.menu("手动演化规则");
+  await waitFor(() => pickerFlow.renderedViews.flat().some((line) => line.includes("选择演化证据")), "manual picker before shutdown");
+  const pickerUi = pickerFlow.events.filter((item) => item === "custom").length;
+  await pickerFlow.shutdown("reload");
+  await pickerRunning;
+  assert.equal(pickerFlow.modelCalls, 0);
+  assert.equal(pickerFlow.events.filter((item) => item === "custom").length, pickerUi);
+  assert.equal(readFileSync(join(pickerRoot, "repo/groups.json"), "utf8"), pickerBeforeGroups);
+
+  const modelRoot = temporaryRoot(t);
+  ok(modelRoot, ["init"]);
+  addCliEvidence(modelRoot, 1);
+  const modelGate = deferred<ModelReply>();
+  const modelFlow = harness(t, { root: modelRoot, modelReply: () => modelGate.promise });
+  const modelBefore = readFileSync(join(modelRoot, "repo/groups.json"), "utf8");
+  const modelRunning = modelFlow.menu("手动演化规则");
+  await waitFor(() => modelFlow.modelCalls === 1, "manual model before shutdown");
+  const modelUi = modelFlow.events.filter((item) => item === "custom").length;
+  await modelFlow.shutdown("reload");
+  await modelRunning;
+  modelGate.resolve({ proposed_rules: ["late manual"], rationale: "late" });
+  await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+  assert.equal(modelFlow.events.filter((item) => item === "custom").length, modelUi);
+  assert.equal(readFileSync(join(modelRoot, "repo/groups.json"), "utf8"), modelBefore);
+
+  const previewRoot = temporaryRoot(t);
+  ok(previewRoot, ["init"]);
+  addCliEvidence(previewRoot, 1);
+  const previewFlow = harness(t, {
+    root: previewRoot,
+    detailInputs: [[]],
+    modelReply: () => ({ proposed_rules: ["preview manual"], rationale: "preview rationale" }),
+  });
+  const previewBefore = readFileSync(join(previewRoot, "repo/groups.json"), "utf8");
+  const previewRunning = previewFlow.menu("手动演化规则");
+  await waitFor(() => previewFlow.renderedViews.flat().some((line) => line.includes("preview rationale")), "manual preview before shutdown");
+  const previewUi = previewFlow.events.filter((item) => item === "custom").length;
+  await previewFlow.shutdown("reload");
+  await previewRunning;
+  assert.equal(previewFlow.events.filter((item) => item === "custom").length, previewUi);
+  assert.equal(readFileSync(join(previewRoot, "repo/groups.json"), "utf8"), previewBefore);
+
+  const failureRoot = temporaryRoot(t);
+  ok(failureRoot, ["init"]);
+  const failureFeedback = addCliEvidence(failureRoot, 1);
+  const failureLearning = learning(failureRoot);
+  const failureEvidence = failureLearning.evidence.find((item: Json) => item.feedback_id === failureFeedback.id);
+  const failureGroup = ok(failureRoot, ["groups"]).groups.find((item: Json) => item.name === "global");
+  const failurePrepared = ok(failureRoot, ["manual-evolution", "--stdin"], {
+    action: "prepare", group_id: failureGroup.id, evidence_ids: [failureEvidence.id],
+  });
+  const beforeFailureGroups = readFileSync(join(failureRoot, "repo/groups.json"), "utf8");
+  const beforeFailureLearning = readFileSync(join(failureRoot, "local/learning.json"), "utf8");
+  const dirty = join(failureRoot, "repo/dirty.txt");
+  writeFileSync(dirty, "dirty\n");
+  spawnSync("git", ["-C", join(failureRoot, "repo"), "add", "dirty.txt"]);
+  assert.equal(cli(failureRoot, ["manual-evolution", "--stdin"], {
+    action: "apply", group_id: failureGroup.id, evidence_ids: failurePrepared.evidence_ids,
+    base_digest: failurePrepared.base_digest, evidence_digest: failurePrepared.evidence_digest,
+    proposed_rules: ["must not apply"], rationale: "dirty",
+  }).ok, false);
+  assert.equal(readFileSync(join(failureRoot, "repo/groups.json"), "utf8"), beforeFailureGroups);
+  assert.equal(readFileSync(join(failureRoot, "local/learning.json"), "utf8"), beforeFailureLearning);
+  spawnSync("git", ["-C", join(failureRoot, "repo"), "reset", "--quiet"]);
+  unlinkSync(dirty);
+
+  const provider = harness(t, { root: failureRoot, modelReply: () => new Error("provider failed") });
+  await provider.menu("手动演化规则");
+  assert.equal(provider.modelCalls, 1);
+  assert.equal(readFileSync(join(failureRoot, "repo/groups.json"), "utf8"), beforeFailureGroups);
+  assert.equal(readFileSync(join(failureRoot, "local/learning.json"), "utf8"), beforeFailureLearning);
 });
 
 test("G02 registered completions reject deleted actions and keep legal group suggestions", async (t) => {
@@ -2314,7 +2860,7 @@ test("N01 real menu keys preserve main and group-rule positions without pseudo r
     terminalRows: 8,
     terminalColumns: 40,
     menuInputs: [
-      { title: "个人偏好", keys: [...Array(6).fill("\x1b[B"), "\x1b[C"] },
+      { title: "个人偏好", keys: [...Array(7).fill("\x1b[B"), "\x1b[C"] },
       { title: "管理偏好组", keys: [...Array(4).fill("\x1b[B"), "\x1b[C"] },
       { title: "管理组内规则", keys: ["\x1b[B", "\x1b[C"] },
       { title: "管理组内规则", keys: ["\x1b[D"] },
@@ -2373,7 +2919,7 @@ test("N02 resource cancellation returns to its menu without writing", async (t) 
   const flow = harness(t, {
     root,
     menuInputs: [
-      { title: "个人偏好", keys: [...Array(6).fill("\x1b[B"), "\x1b[C"] },
+      { title: "个人偏好", keys: [...Array(7).fill("\x1b[B"), "\x1b[C"] },
       { title: "管理偏好组", keys: ["\x1b[B", "\x1b[B", "\x1b[B", "\x1b[C"] },
       { title: "管理偏好组", keys: ["\x1b[D"] },
       { title: "个人偏好", keys: ["\x1b[D"] },

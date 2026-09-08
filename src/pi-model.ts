@@ -32,11 +32,12 @@ export async function runCapturedPiModelBlocking(
   model: CapturedPiModel,
   prompt: string,
   signal: AbortSignal,
+  loaderText = "重新整理中，Esc 取消",
 ): Promise<string | null> {
   if (ctx.mode !== "tui") throw new Error("重新整理反馈需要交互式 TUI");
   if (signal.aborted) return null;
   const result = await ctx.ui.custom<{ output?: string; error?: Error } | null>((tui, theme, _keybindings, done) => {
-    const loader = new BorderedLoader(tui, theme, "重新整理中，Esc 取消");
+    const loader = new BorderedLoader(tui, theme, loaderText);
     const controller = new AbortController();
     let settled = false;
     const finish = (value: { output?: string; error?: Error } | null) => {

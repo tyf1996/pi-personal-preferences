@@ -15,8 +15,8 @@ export class MenuSession {
     this.ctx = ctx;
   }
 
-  async select(key: string, title: string, items: MenuItem[]): Promise<string | undefined> {
-    if (!items.length) return undefined;
+  async select(key: string, title: string, items: MenuItem[], signal?: AbortSignal): Promise<string | undefined> {
+    if (!items.length || signal?.aborted) return undefined;
     if (this.ctx.mode !== "tui") {
       const labels = items.map((item) => item.label ?? item.value);
       const selected = await this.ctx.ui.select(title, labels);
@@ -25,6 +25,15 @@ export class MenuSession {
       return item?.value;
     }
     return this.ctx.ui.custom<string | undefined>((tui, theme, _keybindings, done) => {
+      let settled = false;
+      const finish = (value: string | undefined) => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener("abort", abort);
+        done(value);
+      };
+      const abort = () => finish(undefined);
+      signal?.addEventListener("abort", abort, { once: true });
       const selectItems: SelectItem[] = items.map((item) => ({
         value: item.value,
         label: item.label ?? item.value,
@@ -49,11 +58,11 @@ export class MenuSession {
       selectList.onSelectionChange = rememberCurrent;
       selectList.onSelect = (item) => {
         this.selectedValues.set(key, item.value);
-        done(item.value);
+        finish(item.value);
       };
       selectList.onCancel = () => {
         rememberCurrent();
-        done(undefined);
+        finish(undefined);
       };
 
       const container = new Container();
@@ -63,21 +72,23 @@ export class MenuSession {
       const hint = terminalColumns < 50 ? "↑↓ 移动 · → 进入 · ← 返回" : "↑↓ 移动 · Right/Enter 进入 · Left/Esc 返回";
       container.addChild(new Text(theme.fg("dim", hint), 1, 0));
       container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+      if (signal?.aborted) abort();
 
       return {
         render: (width: number) => container.render(width),
         invalidate: () => container.invalidate(),
         handleInput: (data: string) => {
+          if (settled) return;
           if (matchesKey(data, Key.left)) {
             rememberCurrent();
-            done(undefined);
+            finish(undefined);
             return;
           }
           if (matchesKey(data, Key.right)) {
             const current = selectList.getSelectedItem();
             if (current) {
               this.selectedValues.set(key, current.value);
-              done(current.value);
+              finish(current.value);
             }
             return;
           }

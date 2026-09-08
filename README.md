@@ -108,6 +108,14 @@ ${PI_CODING_AGENT_DIR:-~/.pi/agent}/personal-preferences/
 
 待确认期间新增证据不会使旧候选自动失效或重复收费生成。决定旧候选时，新加入且未被候选涵盖的证据不会被顺带消费。
 
+### 手动演化规则
+
+`/pref` 主菜单始终提供“手动演化规则”。用户选择一个有已整理证据的有效组，再从该组全部当前或历史证据中勾选至少一条；正式规则、待分组结果和失效组证据不作为材料。选择器默认全不选，空选或取消不会调用模型。
+
+选择完成后，扩展固定当前 root、模型、thinking、组和所选证据快照，阻塞调用当前 Pi 模型一次。预览显示所选证据摘要、生成理由、完整现有/建议规则和增删 diff；只有 `A` 明确确认才应用，Right/Enter、R、Left、Esc 或 Ctrl+C 均保留原规则。
+
+手动确认只更新 `groups.json` 并创建必要的 Git 提交，不写 `learning.json`，不消费自动三条计数、不创建手动 pending，也不触发额外模型调用。已有自动候选可并存；手动改变规则后，旧候选继续由现有 digest 和 already-applied 恢复规则处理。建议无变化时不增加 revision 或创建空提交。
+
 ## 数据与同步
 
 正式组和规则继续使用 schema 2：
@@ -143,6 +151,7 @@ local/learning.json
 - 规则写入前检查偏好仓库状态；Git 失败时恢复旧 `groups.json`，push 失败时保留本机提交。
 - 后台 Promise、主动重新整理和状态刷新都归当前 session 生命周期所有。shutdown/reload 会停止新刷新、取消并排空已启动查询；关闭后不操作旧 UI。资源无法在内部上界内关闭时 shutdown 明确失败，不静默继续清理数据根。
 - 重新整理的 prepare 不改业务记录；确认 apply 在一个短锁内校验反馈／旧证据快照和目标组 digest，并原子更新 `learning.json`。
+- 手动演化 prepare 同时绑定目标组与所选证据投影，前后端均执行 4 MiB 门禁；apply 复核组和所选证据 digest，只修改正式规则/Git。未选证据变化不误阻止应用。
 - 正式规则只在当前有效组中注入，并低于安全、正确性、用户当前请求和 `AGENTS.md`；反馈、证据和未确认候选不通过消息 API 进入日常模型上下文。
 
 ## 开发检查
@@ -157,7 +166,7 @@ npm --prefix extensions/pi-personal-preferences run typecheck
 npm --prefix extensions/pi-personal-preferences run check
 ```
 
-`npm run check` 和扩展 CI 都会运行这组快速测试。T01–T08 覆盖 message/块顺序、最终成功结果原位置、局部 call_id、新旧结构校验、4 MiB、后台与重整精确快照、单事件引文和选择器派生。C01–C07 继续覆盖成功 edit/write 配对、patch/diff 与替换 fallback、非连续轮次、工具引文及三条触发；N01–N04 覆盖真实 SelectList 上下左右键、层级返回、按稳定值记忆、动态条目、短终端和 RPC 原生选择。Q01–Q06 使用受控 gate 和真实子进程验证重叠状态刷新、批内失败、abort/timeout、父进程先退出且后代忽略 SIGTERM、明确 cleanup 超期，以及 shutdown 后再删除临时根。套件继续保留 R01–R10、两阶段 shutdown、Git/文件保护和分块 UTF-8 解码等断言。替身消息和模型只证明输入、调用与持久化边界，不代表完整磁盘副作用发现或真实 provider 语义质量。
+`npm run check` 和扩展 CI 都会运行这组快速测试。U01–U08 覆盖常驻入口、多选、单条/历史证据、精确模型输入、完整预览、零写取消、规则事务、自动候选分支及shutdown。T01–T08 覆盖 message/块顺序、最终成功结果原位置、局部 call_id、新旧结构校验、4 MiB、后台与重整精确快照、单事件引文和选择器派生。C01–C07 继续覆盖成功 edit/write 配对、patch/diff 与替换 fallback、非连续轮次、工具引文及三条触发；N01–N04 覆盖真实 SelectList 上下左右键、层级返回、按稳定值记忆、动态条目、短终端和 RPC 原生选择。Q01–Q06 使用受控 gate 和真实子进程验证重叠状态刷新、批内失败、abort/timeout、父进程先退出且后代忽略 SIGTERM、明确 cleanup 超期，以及 shutdown 后再删除临时根。套件继续保留 R01–R10、两阶段 shutdown、Git/文件保护和分块 UTF-8 解码等断言。替身消息和模型只证明输入、调用与持久化边界，不代表完整磁盘副作用发现或真实 provider 语义质量。
 
 Python 源位于 `skills/wikiskill/scripts/`，执行以下命令同步到独立扩展包：
 

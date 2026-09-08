@@ -601,6 +601,87 @@ def _project_evidence(learning: dict[str, Any], evidence: list[dict[str, Any]]) 
     return projected
 
 
+def _manual_evidence_ids(value: Any) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise PreferenceValidationError("evidence_ids must be a non-empty list")
+    result = [checked_id(item, "evidence_id") for item in value]
+    if len(result) != len(set(result)):
+        raise PreferenceValidationError("evidence_ids must not contain duplicates")
+    return result
+
+
+def _manual_evolution(store: PreferenceStore, value: dict[str, Any]) -> dict[str, Any]:
+    action = checked_text(value.get("action"), "action", maximum=32)
+    if action == "list":
+        _strict(value, {"action"}, {"action"}, "manual-evolution list")
+        with store.locked():
+            document = store.groups()
+            learning = store.learning()
+            group_ids = {group["id"] for group in document["groups"]}
+            evidence = [item for item in learning["evidence"] if item.get("group_id") in group_ids]
+            return {
+                "ok": True,
+                "groups": [_group_snapshot(group, store) for group in document["groups"]],
+                "evidence": _project_evidence(learning, evidence),
+            }
+    if action == "prepare":
+        data = _strict(value, {"action", "group_id", "evidence_ids"}, {"action", "group_id", "evidence_ids"}, "manual-evolution prepare")
+        group_id = checked_id(data["group_id"], "group_id")
+        evidence_ids = _manual_evidence_ids(data["evidence_ids"])
+        with store.locked():
+            document = store.groups()
+            group = store.group_by_id(group_id, document)
+            learning = store.learning()
+            selected_ids = set(evidence_ids)
+            selected = [item for item in learning["evidence"] if item["id"] in selected_ids and item.get("group_id") == group_id]
+            if {item["id"] for item in selected} != selected_ids:
+                raise PreferenceValidationError("all selected evidence must exist in the target group")
+            projected = _project_evidence(learning, selected)
+            snapshot = {"group": group, "selected_evidence": projected}
+            if len(stable_json(snapshot).encode("utf-8")) > MAX_SELECTED_SNAPSHOT_BYTES:
+                raise PreferenceValidationError("manual evolution snapshot exceeds 4 MiB")
+            return {
+                "ok": True,
+                "group": group,
+                "evidence": projected,
+                "evidence_ids": [item["id"] for item in selected],
+                "base_digest": store.group_digest(group),
+                "evidence_digest": digest(projected),
+            }
+    if action != "apply":
+        raise PreferenceValidationError(f"unsupported manual-evolution action: {action}")
+    fields = {"action", "group_id", "evidence_ids", "base_digest", "evidence_digest", "proposed_rules", "rationale"}
+    data = _strict(value, fields, fields, "manual-evolution apply")
+    group_id = checked_id(data["group_id"], "group_id")
+    evidence_ids = _manual_evidence_ids(data["evidence_ids"])
+    base_digest = checked_text(data["base_digest"], "base_digest", maximum=80)
+    evidence_digest = checked_text(data["evidence_digest"], "evidence_digest", maximum=80)
+    proposed_rules = validate_proposed_rules(data["proposed_rules"])
+    rationale = checked_text(data["rationale"], "rationale", maximum=4000)
+
+    def mutate(document: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        group = store.group_by_id(group_id, document)
+        if store.group_digest(group) != base_digest:
+            raise PreferenceValidationError("preference group changed while manual evolution was running")
+        learning = store.learning()
+        selected_ids = set(evidence_ids)
+        selected = [item for item in learning["evidence"] if item["id"] in selected_ids and item.get("group_id") == group_id]
+        if {item["id"] for item in selected} != selected_ids:
+            raise PreferenceValidationError("selected manual evolution evidence changed group or no longer exists")
+        projected = _project_evidence(learning, selected)
+        if digest(projected) != evidence_digest:
+            raise PreferenceValidationError("selected manual evolution evidence changed while the model was running")
+        replacement = store.build_rule_replacement(group, proposed_rules)
+        return store.replace_group(document, replacement), {
+            "ok": True,
+            "group_id": group_id,
+            "group_name": group["name"],
+            "rationale": rationale,
+        }
+
+    return _mutate_groups(store, "personal-preferences: manually evolve rules", mutate)
+
+
 def _prepare_evolution(store: PreferenceStore, value: dict[str, Any]) -> dict[str, Any]:
     data = _strict(value, {"group"}, {"group"}, "prepare-evolution")
     group_name = checked_text(data["group"], "group", maximum=128)
@@ -768,6 +849,8 @@ def dispatch(args: argparse.Namespace, stdin_value: dict[str, Any] | None) -> di
         return _feedback_reprocess(store, stdin_value or {})
     if args.command == "pending-list":
         return _pending_list(store)
+    if args.command == "manual-evolution":
+        return _manual_evolution(store, stdin_value or {})
     if args.command == "prepare-evolution":
         return _prepare_evolution(store, stdin_value or {})
     if args.command == "save-evolution":
@@ -782,7 +865,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("command", choices=[
         "init", "status", "groups", "context", "remember", "manage-group", "set-activation", "sync",
         "feedback-create", "feedback-extracted", "feedback-fail", "feedback-complete", "feedback-get", "feedback-list", "feedback-reprocess", "pending-list",
-        "prepare-evolution", "save-evolution", "resolve-evolution",
+        "manual-evolution", "prepare-evolution", "save-evolution", "resolve-evolution",
     ])
     result.add_argument("--stdin", action="store_true")
     result.add_argument("--data-root", type=Path, required=True)
