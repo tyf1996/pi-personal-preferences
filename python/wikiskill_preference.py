@@ -311,13 +311,18 @@ def _quote_sources(feedback: dict[str, Any], evidence: dict[str, Any] | None) ->
         return []
     result = []
     for quote in evidence["supporting_quotes"]:
-        in_user = any(quote in turn["user"] for turn in feedback["selected_turns"])
-        in_assistant = any(quote in turn["assistant"] for turn in feedback["selected_turns"])
-        in_tool = any(
-            quote in change["content"]
-            for turn in feedback["selected_turns"]
-            for change in turn.get("file_changes", [])
-        )
+        in_user = False
+        in_assistant = False
+        in_tool = False
+        for turn in feedback["selected_turns"]:
+            if "events" in turn:
+                in_user = in_user or any(event["type"] == "user" and quote in event["text"] for event in turn["events"])
+                in_assistant = in_assistant or any(event["type"] == "assistant" and quote in event["text"] for event in turn["events"])
+                in_tool = in_tool or any(event["type"] == "file_change_result" and quote in event["content"] for event in turn["events"])
+            else:
+                in_user = in_user or quote in turn["user"]
+                in_assistant = in_assistant or quote in turn["assistant"]
+                in_tool = in_tool or any(quote in change["content"] for change in turn.get("file_changes", []))
         role = "both" if in_user and in_assistant else "user" if in_user else "assistant" if in_assistant else "tool" if in_tool else "unknown"
         result.append({"text": quote, "role": role})
     return result
@@ -327,7 +332,7 @@ def _validated_extraction(store: PreferenceStore, feedback: dict[str, Any], valu
     extraction = validate_extraction(value)
     for source in _quote_sources(feedback, extraction["evidence"]):
         if source["role"] == "unknown":
-            raise PreferenceValidationError("extraction supporting_quotes must each come from one selected user or assistant message")
+            raise PreferenceValidationError("extraction supporting_quotes must each come from one selected user/assistant event or successful file change result")
     return extraction
 
 
@@ -400,7 +405,7 @@ def _feedback_complete(store: PreferenceStore, value: dict[str, Any]) -> dict[st
             raise PreferenceValidationError("feedback explicit group is still valid and cannot be replaced")
         evidence_content = extraction["evidence"]
         if any(source["role"] == "unknown" for source in _quote_sources(feedback, evidence_content)):
-            raise PreferenceValidationError("evidence supporting_quotes must each come from one selected user or assistant message")
+            raise PreferenceValidationError("evidence supporting_quotes must each come from one selected user/assistant event or successful file change result")
         evidence = {
             "id": new_id("evidence-"),
             "created_at": utc_now(),
@@ -500,7 +505,7 @@ def _feedback_reprocess(store: PreferenceStore, value: dict[str, Any]) -> dict[s
         if not had_original_group and suggested_group is not None and suggested_group["id"] != group["id"]:
             raise PreferenceValidationError("certain model group must be used for ungrouped feedback")
         if any(source["role"] == "unknown" for source in _quote_sources(feedback, extraction["evidence"])):
-            raise PreferenceValidationError("reprocessed supporting_quotes must each come from one selected user or assistant message")
+            raise PreferenceValidationError("reprocessed supporting_quotes must each come from one selected user/assistant event or successful file change result")
 
         evidence_content = extraction["evidence"]
         changed = evidence is None or evidence["group_id"] != group["id"] or any(

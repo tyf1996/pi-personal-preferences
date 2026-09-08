@@ -69,9 +69,9 @@ ${PI_CODING_AGENT_DIR:-~/.pi/agent}/personal-preferences/
 ## 反馈流程
 
 1. 扩展从 `SessionManager.getBranch()` 读取当前活动分支最近 10 轮完整真实对话。
-2. 每轮包含用户请求、工具运行期间的用户补充、助手可见文本，以及按 call ID 和工具名配对且 `isError=false` 的成功 `edit`/`write` 快照。失败、孤立、错配、未结束调用及 read/bash 不采集，也不从当前磁盘或 Git 反推历史改动。
-3. `edit` 优先保存成功结果中的 patch/diff，缺失时保存带修改前后标识的合法替换参数；`write` 保存实际提交的完整 content，包括空字符串、缩进和尾部空白。Space 临时勾选，方向键移动，Enter 完成，Left/Esc 取消；每轮提示成功改动数量。
-4. 扩展把反馈与所选文本保存到本机，启动受控后台任务，然后立即退出反馈界面并归还主输入框。从 `/pref` 面板进入时也直接退出面板。
+2. 新采集轮次只保存一份 `events`：按原 message 顺序记录每个 user/assistant 文本块，并在原发起位置和最后匹配成功结果位置记录 `file_change_call`／`file_change_result`。同一 assistant message 内的 text/call/text 也保持块顺序；时间戳不参与排序。
+3. 成功 edit/write 在筛选后按调用源顺序获得轮内局部 `change-N`，call 与唯一 result 显式配对。失败、孤立、错名、未结束调用及 read/bash 完全排除；patch/diff、替换 fallback、空 write、正文空白与脱敏规则不变。
+4. 旧 `{user,assistant,file_changes?}` 继续原样读取，不迁移或伪造 events；旧格式的交错先后未知。Space 临时勾选，方向键移动，Enter 完成，Left/Esc 取消；预览摘要和成功数量从所选快照派生。选择完成后原样保存快照、启动后台任务并立即归还主输入框。
 5. 后台复用提交时捕获的 Pi 模型、thinking、registry、数据根和所选文本，一次完成现有组识别与证据提取；后台只发通知，不打开选择、确认、输入或编辑界面。
 6. 明确有效组直接生成证据；组不确定或已失效时保存完整提取结果，并提示打开 `/pref → 处理待办`。用户主动选组后复用该结果，不重复第一次模型调用。
 7. `/pref` 主菜单中的“反馈与证据”提供模型证据的只读滚动详情；“处理待办”处理待分组、失败重试、规则生成和候选确认。取消查看或选择“稍后”不会丢失待办。
@@ -83,7 +83,7 @@ ${PI_CODING_AGENT_DIR:-~/.pi/agent}/personal-preferences/
 
 “反馈与证据”默认只展示模型证据：摘要、助手实际行为、用户期望、适用范围及带角色的支持引文。引文可来自所选 user、assistant 或成功文件改动正文，文件改动来源显示为“文件改动”。原评价理由、模型配置、完整所选对话和整份补丁继续保存在本机，但不默认拼入结果视图。
 
-所有已保存反馈都可从 `/pref → 重新整理反馈` 主动重新整理。该流程使用原评价、完整理由、原选中对话、当时已保存的成功文件改动快照和操作开始时的当前 Pi 模型，阻塞等待一次新的提取调用；已有 extraction 也不会复用旧结果冒充重新整理。新结果先以只读滚动视图预览，只有明确确认才原位覆盖：
+所有已保存反馈都可从 `/pref → 重新整理反馈` 主动重新整理。该流程使用原评价、完整理由、原样保存的新 events 或旧轮次快照和操作开始时的当前 Pi 模型，阻塞等待一次新的提取调用；已有 extraction 也不会复用旧结果冒充重新整理。新结果先以只读滚动视图预览，只有明确确认才原位覆盖：
 
 - 保留或 Esc：原反馈、证据、候选和规则不变。
 - 确认：保持 feedback ID、已有 evidence ID、证据创建时间和证据数量，只更新模型结果、实际模型及必要组关联。
@@ -122,7 +122,7 @@ repo/groups.json
 local/activations.json
 ```
 
-新反馈、所选对话及其可选 `file_changes` 成功修改快照、可选的已校验联合提取结果、已整理证据、规则候选和批次审阅状态统一保存在：
+新反馈、所选对话的单份有序 `events`（旧记录仍可为 `{user,assistant,file_changes?}`）、可选的已校验联合提取结果、已整理证据、规则候选和批次审阅状态统一保存在：
 
 ```text
 local/learning.json
@@ -137,8 +137,8 @@ local/learning.json
 - stdin 在取得写锁前完成有界读取和 JSON 解析。
 - 本机文件使用固定路径、symlink/路径逃逸检查、严格 JSON 校验和原子替换。
 - 写操作使用短 POSIX 文件锁；模型网络请求、远端 fetch/push 和用户输入等待不持有写锁。
-- 所选 user/assistant、文件路径和成功修改正文共同计入 4 MiB 快照上限；超限在保存和发送前明确拒绝，不截断或忽略部分修改。
-- 模型输出在写入前按固定契约校验；每条原文引用必须完整来自某一个所选 user、assistant 或单条成功修改正文。引文继续保存为 `string[]`，展示和规则演化时派生 `user`、`assistant`、`both`、`tool` 或 `unknown` 角色。
+- 全部 events（或旧轮次字段）共同计入 4 MiB 快照上限；超限在保存和发送前明确拒绝，不裁剪事件。
+- 模型输出在写入前按固定契约校验；新格式引文必须完整来自单个 user/assistant 事件或单条成功 result，不能来自 path、call_id 或跨事件拼接。旧格式继续按单字段校验；展示和规则演化派生 `user`、`assistant`、`both`、`tool` 或 `unknown` 角色。
 - CLI 使用流式 UTF-8 解码，跨 stdout/stderr chunk 的多字节字符保持完整。abort、timeout 和 I/O 错误会保留首错，并在父进程 close 且自有 POSIX 进程组消失后才结束；500ms 后可升级 SIGKILL，1 秒仍未关闭时明确抛出 `PreferenceCliCleanupError`。
 - 规则写入前检查偏好仓库状态；Git 失败时恢复旧 `groups.json`，push 失败时保留本机提交。
 - 后台 Promise、主动重新整理和状态刷新都归当前 session 生命周期所有。shutdown/reload 会停止新刷新、取消并排空已启动查询；关闭后不操作旧 UI。资源无法在内部上界内关闭时 shutdown 明确失败，不静默继续清理数据根。
@@ -157,7 +157,7 @@ npm --prefix extensions/pi-personal-preferences run typecheck
 npm --prefix extensions/pi-personal-preferences run check
 ```
 
-`npm run check` 和扩展 CI 都会运行这组快速测试。C01–C07 覆盖成功 edit/write 配对、稳定顺序、patch/diff 与替换 fallback、非连续轮次、4 MiB 校验、工具引文、后台／重整快照及三条触发；N01–N04 覆盖真实 SelectList 上下左右键、层级返回、按稳定值记忆、动态条目、短终端和 RPC 原生选择。Q01–Q04 使用受控 gate 和真实子进程验证重叠状态刷新、批内失败、abort/timeout、父进程先退出且后代忽略 SIGTERM、明确 cleanup 超期，以及 shutdown 后再删除临时根。套件继续保留 R01–R10、两阶段 shutdown、Git/文件保护和分块 UTF-8 解码等断言。替身消息和模型只证明输入、调用与持久化边界，不代表完整磁盘副作用发现或真实 provider 语义质量。
+`npm run check` 和扩展 CI 都会运行这组快速测试。T01–T08 覆盖 message/块顺序、最终成功结果原位置、局部 call_id、新旧结构校验、4 MiB、后台与重整精确快照、单事件引文和选择器派生。C01–C07 继续覆盖成功 edit/write 配对、patch/diff 与替换 fallback、非连续轮次、工具引文及三条触发；N01–N04 覆盖真实 SelectList 上下左右键、层级返回、按稳定值记忆、动态条目、短终端和 RPC 原生选择。Q01–Q06 使用受控 gate 和真实子进程验证重叠状态刷新、批内失败、abort/timeout、父进程先退出且后代忽略 SIGTERM、明确 cleanup 超期，以及 shutdown 后再删除临时根。套件继续保留 R01–R10、两阶段 shutdown、Git/文件保护和分块 UTF-8 解码等断言。替身消息和模型只证明输入、调用与持久化边界，不代表完整磁盘副作用发现或真实 provider 语义质量。
 
 Python 源位于 `skills/wikiskill/scripts/`，执行以下命令同步到独立扩展包：
 

@@ -244,7 +244,77 @@ def validate_file_change(value: Any, label: str) -> dict[str, str]:
     }
 
 
+def validate_event_turn(value: Any, index: int) -> dict[str, Any]:
+    label = f"selected_turns[{index}]"
+    data = _strict_object(value, {"events"}, {"events"}, label)
+    if not isinstance(data["events"], list) or not data["events"]:
+        raise PreferenceValidationError(f"{label}.events must be a non-empty list")
+    events: list[dict[str, Any]] = []
+    calls: dict[str, str] = {}
+    results: set[str] = set()
+    user_count = 0
+    assistant_count = 0
+    for event_index, raw_event in enumerate(data["events"]):
+        event_label = f"{label}.events[{event_index}]"
+        if not isinstance(raw_event, dict):
+            raise PreferenceValidationError(f"{event_label} must be an object")
+        event_type = raw_event.get("type")
+        if event_type in {"user", "assistant"}:
+            event = _strict_object(raw_event, {"type", "text"}, {"type", "text"}, event_label)
+            events.append({
+                "type": event_type,
+                "text": checked_text(event["text"], f"{event_label}.text", maximum=MAX_SELECTED_TEXT_CHARACTERS),
+            })
+            if event_type == "user":
+                user_count += 1
+            else:
+                assistant_count += 1
+            continue
+        if event_type == "file_change_call":
+            event = _strict_object(raw_event, {"type", "call_id", "tool", "path"}, {"type", "call_id", "tool", "path"}, event_label)
+            call_id = checked_id(event["call_id"], f"{event_label}.call_id")
+            if call_id in calls:
+                raise PreferenceValidationError(f"{event_label}.call_id must be unique within the turn")
+            if event["tool"] not in {"edit", "write"}:
+                raise PreferenceValidationError(f"{event_label}.tool must be edit or write")
+            calls[call_id] = event["tool"]
+            events.append({
+                "type": "file_change_call",
+                "call_id": call_id,
+                "tool": event["tool"],
+                "path": checked_text(event["path"], f"{event_label}.path", maximum=4096),
+            })
+            continue
+        if event_type == "file_change_result":
+            event = _strict_object(raw_event, {"type", "call_id", "content"}, {"type", "call_id", "content"}, event_label)
+            call_id = checked_id(event["call_id"], f"{event_label}.call_id")
+            if call_id not in calls:
+                raise PreferenceValidationError(f"{event_label}.call_id must reference an earlier call in the same turn")
+            if call_id in results:
+                raise PreferenceValidationError(f"{event_label}.call_id already has a result")
+            results.add(call_id)
+            events.append({
+                "type": "file_change_result",
+                "call_id": call_id,
+                "content": checked_content(
+                    event["content"],
+                    f"{event_label}.content",
+                    maximum=MAX_SELECTED_TEXT_CHARACTERS,
+                    allow_empty=calls[call_id] == "write",
+                ),
+            })
+            continue
+        raise PreferenceValidationError(f"{event_label}.type is invalid")
+    if not user_count or not assistant_count:
+        raise PreferenceValidationError(f"{label}.events must contain user and assistant text")
+    if calls.keys() != results:
+        raise PreferenceValidationError(f"{label}.events must pair every call with one result")
+    return {"events": events}
+
+
 def validate_turn(value: Any, index: int) -> dict[str, Any]:
+    if isinstance(value, dict) and "events" in value:
+        return validate_event_turn(value, index)
     required = {"user", "assistant"}
     data = _strict_object(value, required, required | {"file_changes"}, f"selected_turns[{index}]")
     result = {

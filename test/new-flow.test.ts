@@ -11,7 +11,16 @@ import preferenceExtension from "../index.ts";
 import { PreferenceCliCleanupError, runPreferenceCli } from "../src/cli-client.ts";
 import { parsePrefCommand, preferenceCommandNames } from "../src/commands.ts";
 import { formatPreferenceSummary } from "../src/dashboard.ts";
-import { recentConversationTurns, selectConversationTurns, type ConversationTurn } from "../src/feedback-context.ts";
+import {
+  conversationQuoteRole,
+  parseConversationTurn,
+  recentConversationTurns,
+  selectConversationTurns,
+  turnAssistantText,
+  turnFileChanges,
+  turnUserText,
+  type ConversationTurn,
+} from "../src/feedback-context.ts";
 import { renderPreferenceFooter } from "../src/footer.ts";
 import { MenuSession } from "../src/menu.ts";
 import { runCapturedPiModelBlocking } from "../src/pi-model.ts";
@@ -187,6 +196,18 @@ function successfulFileChangeBranch(): Json[] {
     { type: "message", message: { role: "user", content: [{ type: "text", text: "keep the indentation" }] } },
     { type: "message", message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" } },
   ];
+}
+
+function orderedTurn(quote = "ORDERED-TOOL-QUOTE", path = "ordered.md"): Json {
+  return {
+    events: [
+      { type: "user", text: "ordered user" },
+      { type: "assistant", text: "ordered assistant before" },
+      { type: "file_change_call", call_id: "change-1", tool: "write", path },
+      { type: "file_change_result", call_id: "change-1", content: quote },
+      { type: "assistant", text: "ordered assistant after" },
+    ],
+  };
 }
 
 function extraction(quote: string, options: { name?: string | null; certain?: boolean; summary?: string } = {}): Json {
@@ -495,9 +516,9 @@ test("command parser and branch picker keep the bounded real-conversation contra
   branch.push({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "visible-final" }], stopReason: "stop" } });
   const turns = recentConversationTurns({ sessionManager: { getBranch: () => branch } } as any);
   assert.equal(turns.length, 10);
-  assert.equal(turns[0]!.user, "turn-user-2");
-  assert.match(turns.at(-1)!.user, /special-user[\s\S]*user-supplement/);
-  assert.match(turns.at(-1)!.assistant, /visible-progress[\s\S]*visible-final/);
+  assert.equal(turnUserText(turns[0]!), "turn-user-2");
+  assert.match(turnUserText(turns.at(-1)!), /special-user[\s\S]*user-supplement/);
+  assert.match(turnAssistantText(turns.at(-1)!), /visible-progress[\s\S]*visible-final/);
   assert.doesNotMatch(JSON.stringify(turns), /THINK_SECRET|TOOL_RAW|marker/);
 
   const values: ConversationTurn[] = [{ user: "u0", assistant: "a0" }, { user: "u1", assistant: "a1" }];
@@ -512,6 +533,75 @@ test("command parser and branch picker keep the bounded real-conversation contra
   }) as any;
   assert.deepEqual(await selectConversationTurns(pickerCtx([" ", "\x1b[A", " ", "\x1b[B", " ", "\r"]), values), [values[0]]);
   assert.equal(await selectConversationTurns(pickerCtx(["\x1b"]), values), null);
+});
+
+test("T01 collector preserves message and assistant block order without timestamp sorting", () => {
+  const branch = [
+    { type: "message", timestamp: 50, message: { role: "user", content: "first user" } },
+    { type: "message", timestamp: 10, message: { role: "assistant", content: [
+      { type: "text", text: "before call" },
+      { type: "toolCall", id: "native-edit", name: "edit", arguments: { path: "ordered.ts", oldText: "old", newText: "new" } },
+      { type: "text", text: "after call" },
+    ], stopReason: "toolUse" } },
+    { type: "message", timestamp: 10, message: { role: "user", content: [{ type: "text", text: "user supplement" }] } },
+    { type: "message", timestamp: 5, message: { role: "toolResult", toolCallId: "native-edit", toolName: "edit", isError: false, details: { patch: "ORDERED-PATCH" } } },
+    { type: "message", timestamp: 1, message: { role: "assistant", content: "final answer", stopReason: "stop" } },
+  ];
+  const turns = recentConversationTurns({ sessionManager: { getBranch: () => branch } } as any);
+  assert.deepEqual(turns, [{ events: [
+    { type: "user", text: "first user" },
+    { type: "assistant", text: "before call" },
+    { type: "file_change_call", call_id: "change-1", tool: "edit", path: "ordered.ts" },
+    { type: "assistant", text: "after call" },
+    { type: "user", text: "user supplement" },
+    { type: "file_change_result", call_id: "change-1", content: "ORDERED-PATCH" },
+    { type: "assistant", text: "final answer" },
+  ] }]);
+});
+
+test("T02 collector filters failed calls and places only final matching results with local IDs", () => {
+  const branch = [
+    { type: "message", message: { role: "user", content: "turn one" } },
+    { type: "message", message: { role: "assistant", content: [
+      { type: "text", text: "working" },
+      { type: "toolCall", id: "failed", name: "edit", arguments: { path: "failed.ts", oldText: "a", newText: "b" } },
+      { type: "toolCall", id: "kept-a", name: "write", arguments: { path: "a.md", content: "A-CONTENT" } },
+      { type: "toolCall", id: "kept-b", name: "edit", arguments: { path: "b.ts", oldText: "a", newText: "b" } },
+      { type: "toolCall", id: "read", name: "read", arguments: { path: "ignored" } },
+    ], stopReason: "toolUse" } },
+    { type: "message", message: { role: "toolResult", toolCallId: "kept-b", toolName: "edit", isError: false, details: { patch: "OLD-B" } } },
+    { type: "message", message: { role: "toolResult", toolCallId: "orphan", toolName: "edit", isError: false, details: { patch: "ORPHAN" } } },
+    { type: "message", message: { role: "user", content: "between results" } },
+    { type: "message", message: { role: "toolResult", toolCallId: "kept-a", toolName: "edit", isError: false, details: {} } },
+    { type: "message", message: { role: "toolResult", toolCallId: "kept-a", toolName: "write", isError: false, details: {} } },
+    { type: "message", message: { role: "toolResult", toolCallId: "failed", toolName: "edit", isError: true, details: { patch: "FAILED" } } },
+    { type: "message", message: { role: "toolResult", toolCallId: "kept-b", toolName: "edit", isError: false, details: { patch: "FINAL-B" } } },
+    { type: "message", message: { role: "assistant", content: "done", stopReason: "stop" } },
+    { type: "message", message: { role: "user", content: "turn two" } },
+    { type: "message", message: { role: "assistant", content: [
+      { type: "toolCall", id: "kept-a", name: "write", arguments: { path: "second.md", content: "SECOND" } },
+    ], stopReason: "toolUse" } },
+    { type: "message", message: { role: "toolResult", toolCallId: "kept-a", toolName: "write", isError: false, details: {} } },
+    { type: "message", message: { role: "assistant", content: "second done", stopReason: "stop" } },
+  ];
+  const turns = recentConversationTurns({ sessionManager: { getBranch: () => branch } } as any);
+  assert.deepEqual(turns[0], { events: [
+    { type: "user", text: "turn one" },
+    { type: "assistant", text: "working" },
+    { type: "file_change_call", call_id: "change-1", tool: "write", path: "a.md" },
+    { type: "file_change_call", call_id: "change-2", tool: "edit", path: "b.ts" },
+    { type: "user", text: "between results" },
+    { type: "file_change_result", call_id: "change-1", content: "A-CONTENT" },
+    { type: "file_change_result", call_id: "change-2", content: "FINAL-B" },
+    { type: "assistant", text: "done" },
+  ] });
+  assert.deepEqual(turns[1], { events: [
+    { type: "user", text: "turn two" },
+    { type: "file_change_call", call_id: "change-1", tool: "write", path: "second.md" },
+    { type: "file_change_result", call_id: "change-1", content: "SECOND" },
+    { type: "assistant", text: "second done" },
+  ] });
+  assert.doesNotMatch(JSON.stringify(turns), /OLD-B|ORPHAN|FAILED|failed\.ts|ignored/);
 });
 
 test("C01/C03/H01 collects only final matching successful edit/write results in stable call order", () => {
@@ -535,17 +625,19 @@ test("C01/C03/H01 collects only final matching successful edit/write results in 
   ];
   const turns = recentConversationTurns({ sessionManager: { getBranch: () => branch } } as any);
   assert.equal(turns.length, 2);
-  assert.deepEqual(turns[0]!.file_changes?.map((item) => [item.tool, item.path]), [
+  const firstChanges = turnFileChanges(turns[0]!);
+  const secondChanges = turnFileChanges(turns[1]!);
+  assert.deepEqual(firstChanges.map((item) => [item.tool, item.path]), [
     ["edit", "src/a.ts"],
     ["write", "notes.md"],
   ]);
-  assert.equal(turns[0]!.file_changes![0]!.content, "@@ patch body @@");
-  assert.equal(turns[0]!.file_changes![1]!.content, "  line one\nsecret [REDACTED_CREDENTIAL]\n  ");
+  assert.equal(firstChanges[0]!.content, "@@ patch body @@");
+  assert.equal(firstChanges[1]!.content, "  line one\nsecret [REDACTED_CREDENTIAL]\n  ");
   assert.doesNotMatch(JSON.stringify(turns), /DUPLICATE|fail\.ts|mismatch\.ts|missing\.md|CROSS-TURN|read-ignore/);
-  assert.match(turns[1]!.file_changes![0]!.content, /第 1 处修改前[\s\S]*before\n[\s\S]*第 1 处修改后[\s\S]*after\n/);
-  assert.match(turns[1]!.file_changes![0]!.content, /第 2 处修改前[\s\S]*legacy-before[\s\S]*第 2 处修改后[\s\S]*legacy-after/);
-  assert.match(turns[1]!.file_changes![1]!.content, /修改前[\s\S]*object-before[\s\S]*修改后[\s\S]*object-after/);
-  assert.deepEqual(turns[1]!.file_changes![2], { tool: "write", path: "empty.txt", content: "" });
+  assert.match(secondChanges[0]!.content, /第 1 处修改前[\s\S]*before\n[\s\S]*第 1 处修改后[\s\S]*after\n/);
+  assert.match(secondChanges[0]!.content, /第 2 处修改前[\s\S]*legacy-before[\s\S]*第 2 处修改后[\s\S]*legacy-after/);
+  assert.match(secondChanges[1]!.content, /修改前[\s\S]*object-before[\s\S]*修改后[\s\S]*object-after/);
+  assert.deepEqual(secondChanges[2], { tool: "write", path: "empty.txt", content: "" });
 
   const finalResults = recentConversationTurns({ sessionManager: { getBranch: () => [
     { type: "message", message: { role: "user", content: [{ type: "text", text: "final results" }] } },
@@ -565,7 +657,7 @@ test("C01/C03/H01 collects only final matching successful edit/write results in 
     { type: "message", message: { role: "toolResult", toolCallId: "last-success", toolName: "edit", isError: false, details: { patch: "LAST-SUCCESS" } } },
     { type: "message", message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" } },
   ] } } as any);
-  assert.deepEqual(finalResults[0]!.file_changes, [
+  assert.deepEqual(turnFileChanges(finalResults[0]!), [
     { tool: "edit", path: "recover.ts", content: "RECOVERED-LAST" },
     { tool: "edit", path: "mismatch.ts", content: "MATCHED-LAST" },
     { tool: "edit", path: "last-success.ts", content: "LAST-SUCCESS" },
@@ -601,9 +693,9 @@ test("C02/C05/C06 selected noncontinuous turns persist and send only their succe
   assert.equal(flow.modelCalls, 1);
   const saved = learning(flow.root).feedback[0];
   assert.equal(saved.selected_turns.length, 2);
-  assert.deepEqual(saved.selected_turns.flatMap((turn: Json) => (turn.file_changes ?? []).map((item: Json) => item.path)), ["src/a.ts", "notes.md", "last.ts"]);
+  assert.deepEqual(saved.selected_turns.flatMap((turn: Json) => turnFileChanges(parseConversationTurn(turn)).map((item) => item.path)), ["src/a.ts", "notes.md", "last.ts"]);
   assert.match(flow.prompts[0]!, /@@ patch body @@|LAST-SELECTED-DIFF/);
-  assert.match(flow.prompts[0]!, /file_changes 是 Pi 已报告成功/);
+  assert.match(flow.prompts[0]!, /events 必须按数组顺序|相同 call_id/);
   assert.doesNotMatch(flow.prompts[0]!, /MIDDLE-UNSELECTED|middle\.txt/);
   assert.ok(flow.renderedViews.flat().some((line) => line.includes("成功改动")));
   gate.resolve(extraction("@@ patch body @@", { name: "global", certain: true, summary: "tool-backed evidence" }));
@@ -616,6 +708,33 @@ test("C02/C05/C06 selected noncontinuous turns persist and send only their succe
 function themeForTest() {
   return { fg: (_name: string, text: string) => text, bold: (text: string) => text };
 }
+
+test("T05 feedback handler saves and models the exact ordered snapshot without rereading branch or disk", async (t) => {
+  const branch = [
+    { type: "message", message: { role: "user", content: "handler user" } },
+    { type: "message", message: { role: "assistant", content: [
+      { type: "text", text: "handler before" },
+      { type: "toolCall", id: "handler-edit", name: "edit", arguments: { path: "handler.ts", oldText: "old", newText: "new" } },
+    ], stopReason: "toolUse" } },
+    { type: "message", message: { role: "user", content: "handler supplement" } },
+    { type: "message", message: { role: "toolResult", toolCallId: "handler-edit", toolName: "edit", isError: false, details: { patch: "HANDLER-PATCH" } } },
+    { type: "message", message: { role: "assistant", content: "handler done", stopReason: "stop" } },
+  ];
+  const gate = deferred<ModelReply>();
+  const flow = harness(t, { branch, modelReply: () => gate.promise });
+  await flow.pref("feedback --group global good ordered handler");
+  await waitFor(() => flow.modelCalls === 1, "ordered handler model");
+  const savedTurns = learning(flow.root).feedback[0].selected_turns;
+  assert.equal(Object.keys(savedTurns[0]).join(","), "events");
+  const modelInput = JSON.parse(flow.prompts[0]!.split("\n\n").at(-1)!);
+  assert.deepEqual(modelInput.selected_turns, savedTurns);
+  branch.push({ type: "message", message: { role: "user", content: "CURRENT-BRANCH-SENTINEL" } });
+  writeFileSync(join(flow.root, "handler.ts"), "CURRENT-DISK-SENTINEL\n");
+  assert.doesNotMatch(flow.prompts[0]!, /CURRENT-BRANCH-SENTINEL|CURRENT-DISK-SENTINEL/);
+  gate.resolve(extraction("HANDLER-PATCH", { summary: "ordered handler evidence" }));
+  await waitFor(() => learning(flow.root).feedback[0].status === "organized", "ordered handler organization");
+  assert.deepEqual(learning(flow.root).feedback[0].selected_turns, savedTurns);
+});
 
 test("G02 registered completions reject deleted actions and keep legal group suggestions", async (t) => {
   const flow = harness(t);
@@ -698,6 +817,68 @@ test("CLI persists the first extraction across processes and keeps old records r
   });
   assert.equal(rejected.ok, false);
   assert.equal(learning(root).feedback.find((item: Json) => item.id === invalid.feedback.id).extraction, null);
+});
+
+test("T03 backend validates ordered event pairing and rejects mixed or cross-turn structures atomically", (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  const valid = orderedTurn();
+  const invalidTurns: Json[][] = [
+    [{ ...valid, user: "mixed" }],
+    [{ events: [{ type: "user", text: "u" }, { type: "assistant", text: "a" }, { type: "unknown", text: "x" }] }],
+    [{ events: [{ type: "user", text: "u" }, { type: "file_change_call", call_id: "change-1", tool: "bash", path: "x" }, { type: "file_change_result", call_id: "change-1", content: "x" }, { type: "assistant", text: "a" }] }],
+    [{ events: [{ type: "user", text: "u" }, { type: "file_change_call", call_id: "bad id", tool: "edit", path: "x" }, { type: "file_change_result", call_id: "bad id", content: "x" }, { type: "assistant", text: "a" }] }],
+    [{ events: [{ type: "user", text: "u" }, { type: "file_change_call", call_id: "change-1", tool: "edit", path: "x" }, { type: "file_change_call", call_id: "change-1", tool: "edit", path: "y" }, { type: "file_change_result", call_id: "change-1", content: "x" }, { type: "assistant", text: "a" }] }],
+    [{ events: [{ type: "user", text: "u" }, { type: "file_change_result", call_id: "change-1", content: "x" }, { type: "file_change_call", call_id: "change-1", tool: "edit", path: "x" }, { type: "assistant", text: "a" }] }],
+    [{ events: [{ type: "user", text: "u" }, { type: "file_change_call", call_id: "change-1", tool: "edit", path: "x" }, { type: "assistant", text: "a" }] }],
+    [{ events: [{ type: "user", text: "u" }, { type: "file_change_call", call_id: "change-1", tool: "edit", path: "x" }, { type: "file_change_result", call_id: "change-1", content: "x" }, { type: "file_change_result", call_id: "change-1", content: "y" }, { type: "assistant", text: "a" }] }],
+    [valid, { events: [{ type: "user", text: "u2" }, { type: "file_change_result", call_id: "change-1", content: "cross" }, { type: "assistant", text: "a2" }] }],
+  ];
+  for (const selectedTurns of invalidTurns) {
+    const rejected = cli(root, ["feedback-create", "--stdin"], {
+      sentiment: "fix", reason: "invalid ordered turn", selected_turns: selectedTurns, model: null, group: null,
+    });
+    assert.equal(rejected.ok, false);
+  }
+  assert.equal(learning(root).feedback.length, 0);
+});
+
+test("T04 ordered snapshots preserve content, enforce 4 MiB, and coexist with untouched legacy turns", (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  const ordered = {
+    events: [
+      { type: "user", text: "new user" },
+      { type: "assistant", text: "new assistant" },
+      { type: "file_change_call", call_id: "change-1", tool: "edit", path: "patch.ts" },
+      { type: "file_change_result", call_id: "change-1", content: "  PATCH\nsk_abcdefghijklmnop\n  " },
+      { type: "file_change_call", call_id: "change-2", tool: "write", path: "empty.txt" },
+      { type: "file_change_result", call_id: "change-2", content: "" },
+      { type: "assistant", text: "new done" },
+    ],
+  };
+  const legacy = { user: "legacy user", assistant: "legacy assistant" };
+  const created = ok(root, ["feedback-create", "--stdin"], {
+    sentiment: "good", reason: "mixed snapshots", selected_turns: [ordered, legacy], model: null, group: null,
+  });
+  assert.equal(Object.hasOwn(created.feedback.selected_turns[0], "user"), false);
+  assert.deepEqual(created.feedback.selected_turns[0].events[3], {
+    type: "file_change_result", call_id: "change-1", content: "  PATCH\n[REDACTED_CREDENTIAL]\n  ",
+  });
+  assert.deepEqual(created.feedback.selected_turns[0].events[5], { type: "file_change_result", call_id: "change-2", content: "" });
+  assert.deepEqual(created.feedback.selected_turns[1], legacy);
+  const stored = ok(root, ["feedback-get", "--stdin"], { feedback_id: created.feedback.id }).feedback.selected_turns;
+  assert.deepEqual(stored, created.feedback.selected_turns);
+  assert.equal(Object.hasOwn(stored[1], "events"), false);
+  assert.equal(Object.hasOwn(stored[1], "file_changes"), false);
+
+  const huge = orderedTurn("x".repeat(4 * 1024 * 1024));
+  const rejected = cli(root, ["feedback-create", "--stdin"], {
+    sentiment: "fix", reason: "large events", selected_turns: [huge], model: null, group: null,
+  });
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.error.message, /4 MiB|exceeds/);
+  assert.equal(learning(root).feedback.length, 1);
 });
 
 test("C04 validates file changes, preserves old missing fields, and enforces the shared size limit", async (t) => {
@@ -803,6 +984,62 @@ test("candidate snapshots survive new evidence and review only their own evidenc
   const pending = ok(root, ["pending-list"]);
   assert.deepEqual(pending.evolution_groups.map((item: Json) => [item.name, item.new_evidence_count]), [["global", 3]]);
   assert.equal(ok(root, ["prepare-evolution", "--stdin"], { group: "global" }).evidence.length, 6);
+});
+
+test("T07 event quotes use single-event sources and evolution omits raw timelines", (t) => {
+  const roles: ConversationTurn[] = [{ events: [
+    { type: "user", text: "USER-ONLY SHARED" },
+    { type: "assistant", text: "ASSISTANT-ONLY SHARED" },
+    { type: "file_change_call", call_id: "change-1", tool: "write", path: "PATH-ONLY" },
+    { type: "file_change_result", call_id: "change-1", content: "TOOL-ONLY" },
+    { type: "assistant", text: "done" },
+  ] }];
+  assert.equal(conversationQuoteRole(roles, "USER-ONLY"), "user");
+  assert.equal(conversationQuoteRole(roles, "ASSISTANT-ONLY"), "assistant");
+  assert.equal(conversationQuoteRole(roles, "SHARED"), "both");
+  assert.equal(conversationQuoteRole(roles, "TOOL-ONLY"), "tool");
+  assert.equal(conversationQuoteRole(roles, "PATH-ONLY"), "unknown");
+  assert.equal(conversationQuoteRole(roles, "change-1"), "unknown");
+  assert.equal(conversationQuoteRole(roles, "USER-ONLYASSISTANT-ONLY"), "unknown");
+
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  const invalid = ok(root, ["feedback-create", "--stdin"], {
+    sentiment: "fix", reason: "invalid event quote", selected_turns: [orderedTurn("VALID-RESULT", "quoted-path.md")], model: null, group: null,
+  });
+  for (const quote of ["quoted-path.md", "change-1", "ordered userordered assistant before", "OLD-DISCARDED-RESULT"]) {
+    const rejected = cli(root, ["feedback-extracted", "--stdin"], {
+      feedback_id: invalid.feedback.id,
+      extraction: extraction(quote, { name: null, certain: false }),
+      model: { provider: "fake", id: "fake", thinking: "high" },
+    });
+    assert.equal(rejected.ok, false);
+  }
+  assert.equal(learning(root).feedback.find((item: Json) => item.id === invalid.feedback.id).extraction, null);
+
+  for (let index = 1; index <= 3; index += 1) {
+    const quote = `EVENT-TOOL-QUOTE-${index}`;
+    const created = ok(root, ["feedback-create", "--stdin"], {
+      sentiment: "good", reason: `event reason ${index}`,
+      selected_turns: [orderedTurn(`${quote}\nRAW-EVENT-TIMELINE-${index}`, `event-${index}.md`)],
+      model: null, group: "global",
+    });
+    ok(root, ["feedback-extracted", "--stdin"], {
+      feedback_id: created.feedback.id,
+      extraction: extraction(quote, { summary: `event evidence ${index}` }),
+      model: { provider: "fake", id: "fake", thinking: "high" },
+    });
+    const completed = ok(root, ["feedback-complete", "--stdin"], { feedback_id: created.feedback.id, group: "global" });
+    assert.equal(completed.duplicate, false);
+    const detail = ok(root, ["feedback-get", "--stdin"], { feedback_id: created.feedback.id });
+    assert.deepEqual(detail.quote_sources, [{ text: quote, role: "tool" }]);
+  }
+  const prepared = ok(root, ["prepare-evolution", "--stdin"], { group: "global" });
+  assert.equal(prepared.evidence.length, 3);
+  const projected = JSON.stringify(prepared.evidence);
+  assert.match(projected, /"role":"tool"/);
+  assert.doesNotMatch(projected, /RAW-EVENT-TIMELINE|"events"|file_change_call|file_change_result/);
+  assert.equal(learning(root).evidence.length, 3);
 });
 
 test("C07 file changes do not alter evidence counts or leak wholesale into evolution input", (t) => {
@@ -1020,7 +1257,7 @@ test("B01/B09 feedback returns before a delayed model and uses the submission sn
   await flow.pref("feedback --group global good complete historical reason");
   assert.equal(flow.modelCalls, 1);
   assert.match(flow.prompts[0]!, /complete historical reason/);
-  assert.match(flow.prompts[0]!, /assistant 正文只用于描述被评价的实际行为/);
+  assert.match(flow.prompts[0]!, /actual_behavior 的行为证据/);
   assert.match(flow.prompts[0]!, /不能当成用户认可的偏好规则/);
   assert.match(flow.prompts[0]!, /TAIL-UNIQUE/);
   assert.doesNotMatch(flow.prompts[0]!, /unselected-user|unselected-assistant/);
@@ -1035,7 +1272,7 @@ test("B01/B09 feedback returns before a delayed model and uses the submission sn
   await waitFor(() => learning(originalRoot).feedback[0].status === "organized", "background organization");
   assert.equal(learning(originalRoot).feedback[0].model.id, "fake-model");
   assert.equal(learning(originalRoot).feedback[0].model.thinking, "high");
-  assert.equal(learning(originalRoot).feedback[0].selected_turns[0].assistant, longAssistant);
+  assert.equal(turnAssistantText(parseConversationTurn(learning(originalRoot).feedback[0].selected_turns[0])), longAssistant);
   assert.equal(existsSync(join(otherRoot, "local/learning.json")), false);
   assert.equal(flow.modelRequests[0].model.id, "fake-model");
   assert.equal(flow.modelRequests[0].request.reasoning, "high");
@@ -1377,6 +1614,43 @@ test("R02 default evidence detail hides raw feedback metadata and reaches the mo
   assert.doesNotMatch(rendered, new RegExp(first.id.slice(-8)));
 });
 
+test("T06 reprocess reuses exact ordered events while legacy prompts keep order unknown", async (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  const eventTurn = orderedTurn("REPROCESS-EVENT-QUOTE", "event-saved.md");
+  const created = ok(root, ["feedback-create", "--stdin"], {
+    sentiment: "fix", reason: "ordered reprocess", selected_turns: [eventTurn],
+    model: { provider: "fake", id: "old", thinking: "high" }, group: "global",
+  });
+  ok(root, ["feedback-extracted", "--stdin"], {
+    feedback_id: created.feedback.id,
+    extraction: extraction("REPROCESS-EVENT-QUOTE", { summary: "old ordered evidence" }),
+    model: { provider: "fake", id: "old", thinking: "high" },
+  });
+  ok(root, ["feedback-complete", "--stdin"], { feedback_id: created.feedback.id, group: "global" });
+  writeFileSync(join(root, "event-saved.md"), "CURRENT-EVENT-DISK\n");
+  const gate = deferred<ModelReply>();
+  const flow = harness(t, {
+    root,
+    branch: completedBranch(1, "CURRENT-EVENT-BRANCH"),
+    detailInputs: [["r"]],
+    modelReply: () => gate.promise,
+  });
+  const before = readFileSync(join(root, "local/learning.json"), "utf8");
+  const running = flow.menu("重新整理反馈");
+  await waitFor(() => flow.modelCalls === 1, "ordered reprocess model");
+  assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), before);
+  const modelInput = JSON.parse(flow.prompts[0]!.split("\n\n").at(-1)!);
+  assert.deepEqual(modelInput.selected_turns, [eventTurn]);
+  assert.match(flow.prompts[0]!, /events 必须按数组顺序|相同 call_id/);
+  assert.doesNotMatch(flow.prompts[0]!, /CURRENT-EVENT-BRANCH|CURRENT-EVENT-DISK/);
+  gate.resolve(extraction("REPROCESS-EVENT-QUOTE", { summary: "new ordered preview" }));
+  await running;
+  assert.equal(flow.modelCalls, 1);
+  assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), before);
+  assert.match(flow.renderedViews.flat().join("\n"), /\[文件改动\] REPROCESS-EVENT-QUOTE/);
+});
+
 test("R03/R04/H02 reprocess uses the exact saved change snapshot and previews tool quotes", async (t) => {
   const root = temporaryRoot(t);
   ok(root, ["init"]);
@@ -1410,6 +1684,7 @@ test("R03/R04/H02 reprocess uses the exact saved change snapshot and previews to
   assert.match(flow.renderedViews.flat().join("\n"), /重新整理中，Esc 取消/);
   assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), before);
   assert.match(flow.prompts[0]!, /original reason 1|user-1|assistant-1/);
+  assert.match(flow.prompts[0]!, /旧格式仅提供按角色汇总|交错先后未知/);
   const reprocessInput = JSON.parse(flow.prompts[0]!.split("\n\n").at(-1)!);
   assert.deepEqual(reprocessInput.selected_turns, savedTurns);
   assert.doesNotMatch(flow.prompts[0]!, /CURRENT-BRANCH-USER|CURRENT-BRANCH-CHANGE|CURRENT-BRANCH-ASSISTANT|CURRENT-DISK-SENTINEL/);
@@ -1916,7 +2191,7 @@ test("Q06 parent exit always bounds close without signaling a setsid stdio holde
   assert.equal(processExists(withinPid), true);
   writeFileSync(withinRelease, "release\n");
   assert.equal((await within).ok, true);
-  assert.equal(processExists(withinPid), false);
+  await waitFor(() => !processExists(withinPid), "released within-deadline setsid holder");
 
   const overdueRelease = join(root, "overdue.release");
   const overduePidFile = join(root, "overdue.pid");
@@ -1999,6 +2274,35 @@ test("CLI decoding preserves UTF-8 characters split across stdout chunks", async
   ].join("\n"));
   const result = await runPreferenceCli(script, root, []);
   assert.equal(result.text, "你");
+});
+
+test("T08 picker derives summaries and successful counts from events without rewriting the turn", async () => {
+  const turn: ConversationTurn = { events: [
+    { type: "user", text: "first user block" },
+    { type: "assistant", text: "first assistant block" },
+    { type: "file_change_call", call_id: "change-1", tool: "edit", path: "one.ts" },
+    { type: "user", text: "second user block" },
+    { type: "file_change_result", call_id: "change-1", content: "PATCH-ONE" },
+    { type: "file_change_call", call_id: "change-2", tool: "write", path: "two.md" },
+    { type: "file_change_result", call_id: "change-2", content: "" },
+    { type: "assistant", text: "second assistant block" },
+  ] };
+  let rendered: string[] = [];
+  const selected = await selectConversationTurns({
+    mode: "tui",
+    ui: { custom(factory: Function) {
+      return new Promise((resolvePromise) => {
+        const component = factory({ requestRender() {}, terminal: { rows: 24 } }, themeForTest(), {}, resolvePromise);
+        rendered = component.render(100);
+        component.handleInput(" ");
+        component.handleInput("\r");
+      });
+    } },
+  } as any, [turn]);
+  assert.deepEqual(selected, [turn]);
+  assert.match(rendered.join("\n"), /first user block second user block · 成功改动 2/);
+  assert.match(rendered.join("\n"), /first assistant block second assistant block/);
+  assert.deepEqual(selected![0], turn);
 });
 
 test("N01 real menu keys preserve main and group-rule positions without pseudo rows", async (t) => {
