@@ -49,6 +49,7 @@ from wikiskill_preference_core.storage import (  # noqa: E402
 )
 
 MAX_STDIN_BYTES = 32 * 1024 * 1024
+MAX_SELECTED_SNAPSHOT_BYTES = 4 * 1024 * 1024
 
 
 def _stdin_object(args: argparse.Namespace) -> dict[str, Any]:
@@ -279,6 +280,8 @@ def _feedback_create(store: PreferenceStore, value: dict[str, Any]) -> dict[str,
     if not isinstance(data["selected_turns"], list) or not 1 <= len(data["selected_turns"]) <= 10:
         raise PreferenceValidationError("selected_turns must contain 1..10 turns")
     turns = [validate_turn(item, index) for index, item in enumerate(data["selected_turns"])]
+    if len(stable_json(turns).encode("utf-8")) > MAX_SELECTED_SNAPSHOT_BYTES:
+        raise PreferenceValidationError("selected_turns snapshot exceeds 4 MiB")
     model = None if data["model"] is None else validate_model(data["model"])
     group_name = None
     if data["group"] is not None:
@@ -310,7 +313,12 @@ def _quote_sources(feedback: dict[str, Any], evidence: dict[str, Any] | None) ->
     for quote in evidence["supporting_quotes"]:
         in_user = any(quote in turn["user"] for turn in feedback["selected_turns"])
         in_assistant = any(quote in turn["assistant"] for turn in feedback["selected_turns"])
-        role = "both" if in_user and in_assistant else "user" if in_user else "assistant" if in_assistant else "unknown"
+        in_tool = any(
+            quote in change["content"]
+            for turn in feedback["selected_turns"]
+            for change in turn.get("file_changes", [])
+        )
+        role = "both" if in_user and in_assistant else "user" if in_user else "assistant" if in_assistant else "tool" if in_tool else "unknown"
         result.append({"text": quote, "role": role})
     return result
 

@@ -215,12 +215,50 @@ def validate_activations(value: Any) -> dict[str, Any]:
     }
 
 
-def validate_turn(value: Any, index: int) -> dict[str, str]:
-    data = _strict_object(value, {"user", "assistant"}, {"user", "assistant"}, f"selected_turns[{index}]")
+def checked_content(value: Any, label: str, *, maximum: int, allow_empty: bool) -> str:
+    if not isinstance(value, str):
+        raise PreferenceValidationError(f"{label} must be a string")
+    result = redact_sensitive(value)
+    if not allow_empty and not result.strip():
+        raise PreferenceValidationError(f"{label} must not be empty")
+    if len(result) > maximum:
+        raise PreferenceValidationError(f"{label} exceeds {maximum} characters")
+    if any(ord(char) < 32 and char not in "\n\t" for char in result):
+        raise PreferenceValidationError(f"{label} contains a control character")
+    return result
+
+
+def validate_file_change(value: Any, label: str) -> dict[str, str]:
+    data = _strict_object(value, {"tool", "path", "content"}, {"tool", "path", "content"}, label)
+    if data["tool"] not in {"edit", "write"}:
+        raise PreferenceValidationError(f"{label}.tool must be edit or write")
     return {
+        "tool": data["tool"],
+        "path": checked_text(data["path"], f"{label}.path", maximum=4096),
+        "content": checked_content(
+            data["content"],
+            f"{label}.content",
+            maximum=MAX_SELECTED_TEXT_CHARACTERS,
+            allow_empty=data["tool"] == "write",
+        ),
+    }
+
+
+def validate_turn(value: Any, index: int) -> dict[str, Any]:
+    required = {"user", "assistant"}
+    data = _strict_object(value, required, required | {"file_changes"}, f"selected_turns[{index}]")
+    result = {
         "user": checked_text(data["user"], f"selected_turns[{index}].user", maximum=MAX_SELECTED_TEXT_CHARACTERS),
         "assistant": checked_text(data["assistant"], f"selected_turns[{index}].assistant", maximum=MAX_SELECTED_TEXT_CHARACTERS),
     }
+    if "file_changes" in data:
+        if not isinstance(data["file_changes"], list):
+            raise PreferenceValidationError(f"selected_turns[{index}].file_changes must be a list")
+        result["file_changes"] = [
+            validate_file_change(item, f"selected_turns[{index}].file_changes[{change_index}]")
+            for change_index, item in enumerate(data["file_changes"])
+        ]
+    return result
 
 
 def validate_model(value: Any) -> dict[str, str]:

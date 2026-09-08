@@ -64,11 +64,13 @@ ${PI_CODING_AGENT_DIR:-~/.pi/agent}/personal-preferences/
 
 `remember` 保留正式组和规则管理。省略 `--group` 时由用户选择组，不调用学习模型。
 
+`/pref` 主菜单及其业务子菜单使用上下键移动，Right 或 Enter 进入，Left、Esc 或 Ctrl+C 返回。返回后保留本次 `/pref` 调用内的选中位置；菜单不再显示“返回”或“退出”伪业务项。文本输入、编辑器、确认框和非 TUI/RPC 模式继续使用 Pi 原生交互。
+
 ## 反馈流程
 
 1. 扩展从 `SessionManager.getBranch()` 读取当前活动分支最近 10 轮完整真实对话。
-2. 每轮包含用户请求、工具运行期间的用户补充，以及助手可见文本；thinking、system、AGENTS、工具调用和工具原始结果不会进入候选。
-3. Space 临时勾选，方向键移动，Enter 完成，Esc 取消。选择器按终端高度滚动，当前项始终保持可见；没有勾选内容时明确显示“本次反馈未保存”。
+2. 每轮包含用户请求、工具运行期间的用户补充、助手可见文本，以及按 call ID 和工具名配对且 `isError=false` 的成功 `edit`/`write` 快照。失败、孤立、错配、未结束调用及 read/bash 不采集，也不从当前磁盘或 Git 反推历史改动。
+3. `edit` 优先保存成功结果中的 patch/diff，缺失时保存带修改前后标识的合法替换参数；`write` 保存实际提交的完整 content，包括空字符串、缩进和尾部空白。Space 临时勾选，方向键移动，Enter 完成，Left/Esc 取消；每轮提示成功改动数量。
 4. 扩展把反馈与所选文本保存到本机，启动受控后台任务，然后立即退出反馈界面并归还主输入框。从 `/pref` 面板进入时也直接退出面板。
 5. 后台复用提交时捕获的 Pi 模型、thinking、registry、数据根和所选文本，一次完成现有组识别与证据提取；后台只发通知，不打开选择、确认、输入或编辑界面。
 6. 明确有效组直接生成证据；组不确定或已失效时保存完整提取结果，并提示打开 `/pref → 处理待办`。用户主动选组后复用该结果，不重复第一次模型调用。
@@ -79,9 +81,9 @@ ${PI_CODING_AGENT_DIR:-~/.pi/agent}/personal-preferences/
 
 ## 查看与重新整理
 
-“反馈与证据”默认只展示模型证据：摘要、助手实际行为、用户期望、适用范围及带角色的支持引文。原评价理由、模型配置和完整所选对话继续保存在本机，但不默认拼入结果视图。
+“反馈与证据”默认只展示模型证据：摘要、助手实际行为、用户期望、适用范围及带角色的支持引文。引文可来自所选 user、assistant 或成功文件改动正文，文件改动来源显示为“文件改动”。原评价理由、模型配置、完整所选对话和整份补丁继续保存在本机，但不默认拼入结果视图。
 
-所有已保存反馈都可从 `/pref → 重新整理反馈` 主动重新整理。该流程使用原评价、完整理由、原选中对话和操作开始时的当前 Pi 模型，阻塞等待一次新的提取调用；已有 extraction 也不会复用旧结果冒充重新整理。新结果先以只读滚动视图预览，只有明确确认才原位覆盖：
+所有已保存反馈都可从 `/pref → 重新整理反馈` 主动重新整理。该流程使用原评价、完整理由、原选中对话、当时已保存的成功文件改动快照和操作开始时的当前 Pi 模型，阻塞等待一次新的提取调用；已有 extraction 也不会复用旧结果冒充重新整理。新结果先以只读滚动视图预览，只有明确确认才原位覆盖：
 
 - 保留或 Esc：原反馈、证据、候选和规则不变。
 - 确认：保持 feedback ID、已有 evidence ID、证据创建时间和证据数量，只更新模型结果、实际模型及必要组关联。
@@ -120,7 +122,7 @@ repo/groups.json
 local/activations.json
 ```
 
-新反馈、所选对话、可选的已校验联合提取结果、已整理证据、规则候选和批次审阅状态统一保存在：
+新反馈、所选对话及其可选 `file_changes` 成功修改快照、可选的已校验联合提取结果、已整理证据、规则候选和批次审阅状态统一保存在：
 
 ```text
 local/learning.json
@@ -135,11 +137,11 @@ local/learning.json
 - stdin 在取得写锁前完成有界读取和 JSON 解析。
 - 本机文件使用固定路径、symlink/路径逃逸检查、严格 JSON 校验和原子替换。
 - 写操作使用短 POSIX 文件锁；模型网络请求、远端 fetch/push 和用户输入等待不持有写锁。
-- 所选对话正文不做静默截断；总量超过 4 MiB 时在保存和发送前明确拒绝。
-- 模型输出在写入前按固定契约校验；每条原文引用必须完整来自某一个所选 user 或 assistant 正文。引文继续保存为 `string[]`，展示和规则演化时派生 `user`、`assistant`、`both` 或 `unknown` 角色。
-- CLI 使用流式 UTF-8 解码，跨 stdout/stderr chunk 的多字节字符保持完整。
+- 所选 user/assistant、文件路径和成功修改正文共同计入 4 MiB 快照上限；超限在保存和发送前明确拒绝，不截断或忽略部分修改。
+- 模型输出在写入前按固定契约校验；每条原文引用必须完整来自某一个所选 user、assistant 或单条成功修改正文。引文继续保存为 `string[]`，展示和规则演化时派生 `user`、`assistant`、`both`、`tool` 或 `unknown` 角色。
+- CLI 使用流式 UTF-8 解码，跨 stdout/stderr chunk 的多字节字符保持完整。abort、timeout 和 I/O 错误会保留首错，并在父进程 close 且自有 POSIX 进程组消失后才结束；500ms 后可升级 SIGKILL，1 秒仍未关闭时明确抛出 `PreferenceCliCleanupError`。
 - 规则写入前检查偏好仓库状态；Git 失败时恢复旧 `groups.json`，push 失败时保留本机提交。
-- 后台 Promise 和主动重新整理都支持有界取消；session shutdown/reload 后，忽略 abort 的迟到结果不会打开预览、写证据、写候选或通知新会话。
+- 后台 Promise、主动重新整理和状态刷新都归当前 session 生命周期所有。shutdown/reload 会停止新刷新、取消并排空已启动查询；关闭后不操作旧 UI。资源无法在内部上界内关闭时 shutdown 明确失败，不静默继续清理数据根。
 - 重新整理的 prepare 不改业务记录；确认 apply 在一个短锁内校验反馈／旧证据快照和目标组 digest，并原子更新 `learning.json`。
 - 正式规则只在当前有效组中注入，并低于安全、正确性、用户当前请求和 `AGENTS.md`；反馈、证据和未确认候选不通过消息 API 进入日常模型上下文。
 
@@ -155,7 +157,7 @@ npm --prefix extensions/pi-personal-preferences run typecheck
 npm --prefix extensions/pi-personal-preferences run check
 ```
 
-`npm run check` 和扩展 CI 都会运行这组快速测试。新增 R01–R10 覆盖：菜单统一入口、默认模型证据视图、阻塞式重新调用、确认前零写、原位覆盖、后置分组、快照冲突、证据内容 digest、候选失效和重新整理取消。套件继续保留普通反馈后台返回、待办复用、3/6 条全量演化、两阶段 shutdown、最近 10 轮投影、Git/文件保护和分块 UTF-8 解码等断言。测试中的 fake 模型只证明调用与数据边界，不代表真实 provider 的语义质量。
+`npm run check` 和扩展 CI 都会运行这组快速测试。C01–C07 覆盖成功 edit/write 配对、稳定顺序、patch/diff 与替换 fallback、非连续轮次、4 MiB 校验、工具引文、后台／重整快照及三条触发；N01–N04 覆盖真实 SelectList 上下左右键、层级返回、按稳定值记忆、动态条目、短终端和 RPC 原生选择。Q01–Q04 使用受控 gate 和真实子进程验证重叠状态刷新、批内失败、abort/timeout、父进程先退出且后代忽略 SIGTERM、明确 cleanup 超期，以及 shutdown 后再删除临时根。套件继续保留 R01–R10、两阶段 shutdown、Git/文件保护和分块 UTF-8 解码等断言。替身消息和模型只证明输入、调用与持久化边界，不代表完整磁盘副作用发现或真实 provider 语义质量。
 
 Python 源位于 `skills/wikiskill/scripts/`，执行以下命令同步到独立扩展包：
 

@@ -93,7 +93,7 @@ export async function showReadOnlyDetails(
           tui.requestRender();
         } else if (options.decision && (data === "a" || data === "A")) finish("apply");
         else if (options.decision && (data === "r" || data === "R")) finish("reject");
-        else if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) finish("later");
+        else if (matchesKey(data, Key.left) || matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) finish("later");
       },
       invalidate(): void {
         cachedWidth = 0;

@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { MenuSession, type MenuItem } from "./menu.ts";
 
 export type PreferenceCliInvoker = (
   args: string[],
@@ -29,10 +30,10 @@ export interface PreferenceStatus {
 
 export interface DashboardActions {
   remember: (rule: string) => Promise<void>;
-  feedback: () => Promise<void>;
-  evidence: () => Promise<void>;
-  reprocess: () => Promise<void>;
-  pending: () => Promise<void>;
+  feedback: () => Promise<boolean>;
+  evidence: (menu: MenuSession) => Promise<void>;
+  reprocess: (menu: MenuSession) => Promise<boolean>;
+  pending: (menu: MenuSession) => Promise<void>;
   sessionId: string;
 }
 
@@ -126,58 +127,88 @@ function groupDetails(group: PreferenceGroup, active: ContextResult): string {
   ].join("\n");
 }
 
-async function manageGroup(ctx: ExtensionCommandContext, invoke: PreferenceCliInvoker, sessionId: string): Promise<void> {
-  const action = await ctx.ui.select("管理偏好组", ["查看", "创建", "编辑介绍", "删除", "管理规则", "返回"]);
-  if (!action || action === "返回") return;
-  const values = await groups(invoke);
-  if (action === "查看") {
-    const selected = await chooseGroup(ctx, values, "查看偏好组");
-    if (selected) ctx.ui.notify(groupDetails(selected, await context(ctx, invoke, sessionId)), "info");
-    return;
+const groupMenuItems: MenuItem[] = [
+  { value: "view", label: "查看" },
+  { value: "create", label: "创建" },
+  { value: "description", label: "编辑介绍" },
+  { value: "delete", label: "删除" },
+  { value: "rules", label: "管理规则" },
+];
+
+async function manageRules(
+  ctx: ExtensionCommandContext,
+  invoke: PreferenceCliInvoker,
+  menu: MenuSession,
+  groupId: string,
+): Promise<void> {
+  for (;;) {
+    const values = await groups(invoke);
+    const selected = values.find((group) => group.id === groupId);
+    if (!selected) return;
+    const action = await menu.select(`rules:${groupId}`, `管理组内规则 · ${selected.name}`, [
+      { value: "add", label: "增加" },
+      { value: "update", label: "修改" },
+      { value: "delete", label: "删除" },
+      { value: "move", label: "移动" },
+    ]);
+    if (!action) return;
+    if (action === "add") {
+      const rule = (await ctx.ui.input("增加规则", "输入组内规则"))?.trim();
+      if (rule) await invoke(["manage-group", "--stdin"], { action: "add_rule", group: selected.name, rule });
+      continue;
+    }
+    if (!selected.rules.length) {
+      ctx.ui.notify("当前组没有规则。", "info");
+      continue;
+    }
+    const rule = await ctx.ui.select("选择规则", selected.rules);
+    if (!rule) continue;
+    if (action === "update") {
+      const replacement = (await ctx.ui.editor("修改规则", rule))?.trim();
+      if (replacement) await invoke(["manage-group", "--stdin"], { action: "update_rule", group: selected.name, rule, replacement });
+    } else if (action === "delete") {
+      if (await ctx.ui.confirm("删除规则？", rule)) await invoke(["manage-group", "--stdin"], { action: "delete_rule", group: selected.name, rule });
+    } else {
+      const target = await chooseGroup(ctx, values.filter((group) => group.id !== selected.id), "移动到其他组");
+      if (target) await invoke(["manage-group", "--stdin"], { action: "move_rule", source_group: selected.name, target_group: target.name, rule });
+    }
   }
-  if (action === "创建") {
-    const name = (await ctx.ui.input("组名", "例如 coding"))?.trim();
-    if (!name) return;
-    const description = (await ctx.ui.input("组介绍", "说明这个组适用什么场景"))?.trim();
-    if (!description) return;
-    await invoke(["manage-group", "--stdin"], { action: "create", name, description });
-    ctx.ui.notify(`已创建偏好组：${name}`, "info");
-    return;
-  }
-  const selected = await chooseGroup(ctx, values, "选择偏好组");
-  if (!selected) return;
-  if (action === "编辑介绍") {
-    const description = (await ctx.ui.editor("编辑组介绍", selected.description))?.trim();
-    if (!description) return;
-    await invoke(["manage-group", "--stdin"], { action: "update_description", group: selected.name, description });
-    return;
-  }
-  if (action === "删除") {
-    if (!await ctx.ui.confirm("删除偏好组？", `将删除正式组 ${selected.name} 及其规则；本机历史反馈和证据继续保留。`)) return;
-    await invoke(["manage-group", "--stdin"], { action: "delete", group: selected.name });
-    return;
-  }
-  const ruleAction = await ctx.ui.select("管理组内规则", ["增加", "修改", "删除", "移动", "返回"]);
-  if (!ruleAction || ruleAction === "返回") return;
-  if (ruleAction === "增加") {
-    const rule = (await ctx.ui.input("增加规则", "输入组内规则"))?.trim();
-    if (rule) await invoke(["manage-group", "--stdin"], { action: "add_rule", group: selected.name, rule });
-    return;
-  }
-  if (!selected.rules.length) {
-    ctx.ui.notify("当前组没有规则。", "info");
-    return;
-  }
-  const rule = await ctx.ui.select("选择规则", selected.rules);
-  if (!rule) return;
-  if (ruleAction === "修改") {
-    const replacement = (await ctx.ui.editor("修改规则", rule))?.trim();
-    if (replacement) await invoke(["manage-group", "--stdin"], { action: "update_rule", group: selected.name, rule, replacement });
-  } else if (ruleAction === "删除") {
-    if (await ctx.ui.confirm("删除规则？", rule)) await invoke(["manage-group", "--stdin"], { action: "delete_rule", group: selected.name, rule });
-  } else {
-    const target = await chooseGroup(ctx, values.filter((group) => group.id !== selected.id), "移动到其他组");
-    if (target) await invoke(["manage-group", "--stdin"], { action: "move_rule", source_group: selected.name, target_group: target.name, rule });
+}
+
+async function manageGroup(
+  ctx: ExtensionCommandContext,
+  invoke: PreferenceCliInvoker,
+  sessionId: string,
+  menu: MenuSession,
+): Promise<void> {
+  for (;;) {
+    const action = await menu.select("manage-groups", "管理偏好组", groupMenuItems);
+    if (!action) return;
+    const values = await groups(invoke);
+    if (action === "view") {
+      const selected = await chooseGroup(ctx, values, "查看偏好组");
+      if (selected) ctx.ui.notify(groupDetails(selected, await context(ctx, invoke, sessionId)), "info");
+      continue;
+    }
+    if (action === "create") {
+      const name = (await ctx.ui.input("组名", "例如 coding"))?.trim();
+      if (!name) continue;
+      const description = (await ctx.ui.input("组介绍", "说明这个组适用什么场景"))?.trim();
+      if (description) await invoke(["manage-group", "--stdin"], { action: "create", name, description });
+      continue;
+    }
+    const selected = await chooseGroup(ctx, values, "选择偏好组");
+    if (!selected) continue;
+    if (action === "description") {
+      const description = (await ctx.ui.editor("编辑组介绍", selected.description))?.trim();
+      if (description) await invoke(["manage-group", "--stdin"], { action: "update_description", group: selected.name, description });
+    } else if (action === "delete") {
+      if (await ctx.ui.confirm("删除偏好组？", `将删除正式组 ${selected.name} 及其规则；本机历史反馈和证据继续保留。`)) {
+        await invoke(["manage-group", "--stdin"], { action: "delete", group: selected.name });
+      }
+    } else {
+      await manageRules(ctx, invoke, menu, selected.id);
+    }
   }
 }
 
@@ -202,55 +233,48 @@ async function setActivation(
   });
 }
 
+const mainMenuItems: MenuItem[] = [
+  { value: "status", label: "查看当前状态" },
+  { value: "feedback", label: "记录反馈" },
+  { value: "evidence", label: "反馈与证据" },
+  { value: "reprocess", label: "重新整理反馈" },
+  { value: "pending", label: "处理待办" },
+  { value: "remember", label: "记住一条规则" },
+  { value: "groups", label: "管理组与规则" },
+  { value: "directory-enable", label: "为当前目录启用组" },
+  { value: "directory-disable", label: "为当前目录禁用组" },
+  { value: "session-enable", label: "为当前会话启用组" },
+  { value: "session-disable", label: "为当前会话禁用组" },
+  { value: "sync", label: "同步正式规则" },
+];
+
 export async function showPreferenceDashboard(
   ctx: ExtensionCommandContext,
   invoke: PreferenceCliInvoker,
   actions: DashboardActions,
 ): Promise<void> {
+  const menu = new MenuSession(ctx);
   for (;;) {
     const status = await invoke(["status"]) as PreferenceStatus;
     const active = await context(ctx, invoke, actions.sessionId);
-    const summary = formatPreferenceSummary(
-      status,
-      status.enabled === false ? [] : active.effective_groups,
-      { actionable: Number(status.actionable_count ?? 0) },
-    );
-    const choice = await ctx.ui.select("个人偏好", [
-      "查看当前状态",
-      "记录反馈",
-      "反馈与证据",
-      "重新整理反馈",
-      "处理待办",
-      "记住一条规则",
-      "管理组与规则",
-      "为当前目录启用组",
-      "为当前目录禁用组",
-      "为当前会话启用组",
-      "为当前会话禁用组",
-      "同步正式规则",
-      "退出",
-    ]);
-    if (!choice || choice === "退出") return;
-    if (choice === "查看当前状态") ctx.ui.notify(formatPreferenceDetails(status, active), "info");
-    else if (choice === "记录反馈") {
-      await actions.feedback();
-      return;
-    }
-    else if (choice === "反馈与证据") await actions.evidence();
-    else if (choice === "重新整理反馈") {
-      await actions.reprocess();
-      return;
-    }
-    else if (choice === "处理待办") await actions.pending();
-    else if (choice === "记住一条规则") {
+    const choice = await menu.select("main", "个人偏好", mainMenuItems);
+    if (!choice) return;
+    if (choice === "status") ctx.ui.notify(formatPreferenceDetails(status, active), "info");
+    else if (choice === "feedback") {
+      if (await actions.feedback()) return;
+    } else if (choice === "evidence") await actions.evidence(menu);
+    else if (choice === "reprocess") {
+      if (await actions.reprocess(menu)) return;
+    } else if (choice === "pending") await actions.pending(menu);
+    else if (choice === "remember") {
       const rule = (await ctx.ui.input("记住规则", "输入明确规则"))?.trim();
       if (rule) await actions.remember(rule);
-    } else if (choice === "管理组与规则") await manageGroup(ctx, invoke, actions.sessionId);
-    else if (choice === "为当前目录启用组") await setActivation(ctx, invoke, actions.sessionId, "directory", true);
-    else if (choice === "为当前目录禁用组") await setActivation(ctx, invoke, actions.sessionId, "directory", false);
-    else if (choice === "为当前会话启用组") await setActivation(ctx, invoke, actions.sessionId, "session", true);
-    else if (choice === "为当前会话禁用组") await setActivation(ctx, invoke, actions.sessionId, "session", false);
-    else if (choice === "同步正式规则") {
+    } else if (choice === "groups") await manageGroup(ctx, invoke, actions.sessionId, menu);
+    else if (choice === "directory-enable") await setActivation(ctx, invoke, actions.sessionId, "directory", true);
+    else if (choice === "directory-disable") await setActivation(ctx, invoke, actions.sessionId, "directory", false);
+    else if (choice === "session-enable") await setActivation(ctx, invoke, actions.sessionId, "session", true);
+    else if (choice === "session-disable") await setActivation(ctx, invoke, actions.sessionId, "session", false);
+    else if (choice === "sync") {
       const result = await invoke(["sync"], undefined, 180_000);
       ctx.ui.notify(`正式规则同步完成：${syncLabel(result.sync_state)}`, "info");
     }

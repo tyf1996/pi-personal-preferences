@@ -1,17 +1,19 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { initTheme } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import preferenceExtension from "../index.ts";
-import { runPreferenceCli } from "../src/cli-client.ts";
+import { PreferenceCliCleanupError, runPreferenceCli } from "../src/cli-client.ts";
 import { parsePrefCommand, preferenceCommandNames } from "../src/commands.ts";
 import { formatPreferenceSummary } from "../src/dashboard.ts";
 import { recentConversationTurns, selectConversationTurns, type ConversationTurn } from "../src/feedback-context.ts";
 import { renderPreferenceFooter } from "../src/footer.ts";
+import { MenuSession } from "../src/menu.ts";
 import { runCapturedPiModelBlocking } from "../src/pi-model.ts";
 
 initTheme("dark", false);
@@ -41,10 +43,88 @@ async function waitFor(predicate: () => boolean, label: string, timeoutMs = 8_00
   }
 }
 
+interface FixtureResources {
+  roots: Set<string>;
+  shutdowns: Array<() => Promise<void>>;
+  cleanupFailures: unknown[];
+}
+
+const fixtureResources = new WeakMap<test.TestContext, FixtureResources>();
+
+function resourcesFor(t: test.TestContext): FixtureResources {
+  const existing = fixtureResources.get(t);
+  if (existing) return existing;
+  const resources: FixtureResources = { roots: new Set(), shutdowns: [], cleanupFailures: [] };
+  fixtureResources.set(t, resources);
+  t.after(async () => {
+    const failures: unknown[] = [...resources.cleanupFailures];
+    for (const shutdown of [...resources.shutdowns].reverse()) {
+      try {
+        await shutdown();
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) throw new AggregateError(failures, "personal preference fixture cleanup failed");
+    for (const root of resources.roots) rmSync(root, { recursive: true, force: true });
+  });
+  return resources;
+}
+
 function temporaryRoot(t: test.TestContext): string {
   const root = mkdtempSync(join(tmpdir(), "pi-pref-fast-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+  resourcesFor(t).roots.add(root);
   return root;
+}
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+function writeStatusGateCli(root: string): { script: string; events: string; allow: string; failStatus: string } {
+  const events = join(root, "status-events");
+  mkdirSync(events);
+  const script = join(root, "status-gate.py");
+  const allow = join(events, "allow");
+  const failStatus = join(events, "fail-status");
+  writeFileSync(script, [
+    "import json, os, signal, sys, time",
+    "events = os.environ['PI_PREF_STATUS_EVENTS']",
+    "allow = os.environ['PI_PREF_STATUS_ALLOW']",
+    "fail_status = os.environ['PI_PREF_STATUS_FAIL']",
+    "command = sys.argv[1]",
+    "pid = os.getpid()",
+    "def mark(kind):",
+    "    with open(os.path.join(events, f'{pid}.{command}.{kind}'), 'w', encoding='utf-8') as handle:",
+    "        handle.write(kind)",
+    "def stop(signum, _frame):",
+    "    mark('closed')",
+    "    raise SystemExit(128 + signum)",
+    "signal.signal(signal.SIGTERM, stop)",
+    "mark('started')",
+    "if not os.path.exists(allow) and command == 'status' and os.path.exists(fail_status):",
+    "    mark('failed')",
+    "    mark('closed')",
+    "    print(json.dumps({'ok': False, 'error': {'message': 'controlled status failure'}}))",
+    "    raise SystemExit(1)",
+    "while not os.path.exists(allow) and not os.path.exists(os.path.join(events, f'release-{pid}')):",
+    "    time.sleep(0.01)",
+    "if command == 'status':",
+    "    value = {'ok': True, 'enabled': True, 'groups': 1, 'rules': 0, 'sync_state': 'clean', 'actionable_count': 0}",
+    "elif command == 'context':",
+    "    value = {'ok': True, 'effective_groups': ['global']}",
+    "else:",
+    "    value = {'ok': True, 'feedback': [], 'proposals': [], 'evolution_groups': []}",
+    "mark('closed')",
+    "print(json.dumps(value))",
+  ].join("\n"));
+  return { script, events, allow, failStatus };
 }
 
 function cli(root: string, args: string[], input?: Json): Json {
@@ -80,6 +160,33 @@ function completedBranch(count: number, prefix = "turn"): Json[] {
     entries.push({ type: "message", message: { role: "assistant", content: [{ type: "text", text: `${prefix}-assistant-${index}` }], stopReason: "stop" } });
   }
   return entries;
+}
+
+function successfulFileChangeBranch(): Json[] {
+  return [
+    { type: "message", message: { role: "user", content: [{ type: "text", text: "change files" }] } },
+    { type: "message", message: {
+      role: "assistant",
+      content: [
+        { type: "text", text: "editing" },
+        { type: "toolCall", id: "edit-ok", name: "edit", arguments: { path: "src/a.ts", edits: [{ oldText: "old", newText: "new" }] } },
+        { type: "toolCall", id: "write-ok", name: "write", arguments: { path: "notes.md", content: "  line one\nsecret sk_abcdefghijklmnop\n  " } },
+        { type: "toolCall", id: "read-ignore", name: "read", arguments: { path: "src/a.ts" } },
+        { type: "toolCall", id: "edit-fail", name: "edit", arguments: { path: "src/fail.ts", oldText: "x", newText: "y" } },
+        { type: "toolCall", id: "edit-mismatch", name: "edit", arguments: { path: "src/mismatch.ts", oldText: "x", newText: "y" } },
+        { type: "toolCall", id: "write-missing", name: "write", arguments: { path: "missing.md", content: "missing" } },
+      ],
+      stopReason: "toolUse",
+    } },
+    { type: "message", message: { role: "toolResult", toolCallId: "write-ok", toolName: "write", isError: false, content: [{ type: "text", text: "written" }], details: {} } },
+    { type: "message", message: { role: "toolResult", toolCallId: "edit-ok", toolName: "edit", isError: false, content: [{ type: "text", text: "edited" }], details: { patch: "@@ patch body @@" } } },
+    { type: "message", message: { role: "toolResult", toolCallId: "edit-ok", toolName: "edit", isError: false, content: [{ type: "text", text: "duplicate" }], details: { patch: "@@ patch body @@" } } },
+    { type: "message", message: { role: "toolResult", toolCallId: "edit-fail", toolName: "edit", isError: true, content: [{ type: "text", text: "failed" }] } },
+    { type: "message", message: { role: "toolResult", toolCallId: "orphan", toolName: "write", isError: false, content: [{ type: "text", text: "orphan" }] } },
+    { type: "message", message: { role: "toolResult", toolCallId: "edit-mismatch", toolName: "write", isError: false, content: [{ type: "text", text: "mismatch" }] } },
+    { type: "message", message: { role: "user", content: [{ type: "text", text: "keep the indentation" }] } },
+    { type: "message", message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" } },
+  ];
 }
 
 function extraction(quote: string, options: { name?: string | null; certain?: boolean; summary?: string } = {}): Json {
@@ -137,6 +244,7 @@ interface HarnessOptions {
   terminalRows?: number;
   terminalColumns?: number;
   preferenceCli?: string;
+  menuInputs?: Array<{ title: string; keys: string[] }>;
 }
 
 function harness(t: test.TestContext, options: HarnessOptions = {}) {
@@ -165,6 +273,7 @@ function harness(t: test.TestContext, options: HarnessOptions = {}) {
   const loaderInputs = [...(options.loaderInputs ?? [])];
   const detailInputs = [...(options.detailInputs ?? [])];
   const inputReplies = [...(options.inputReplies ?? [])];
+  const menuInputs = [...(options.menuInputs ?? [])];
   const theme = { fg(_name: string, text: string) { return text; }, bold(text: string) { return text; } };
   const terminal = { rows: options.terminalRows ?? 24, columns: options.terminalColumns ?? 80 };
   const tui = { requestRender() {}, terminal };
@@ -173,6 +282,24 @@ function harness(t: test.TestContext, options: HarnessOptions = {}) {
   let menuTarget: string | undefined;
   let menuSeen = false;
   const branch = options.branch ?? completedBranch(1, "selected");
+
+  const mainMenuChoices = [
+    "查看当前状态", "记录反馈", "反馈与证据", "重新整理反馈", "处理待办", "记住一条规则", "管理组与规则",
+    "为当前目录启用组", "为当前目录禁用组", "为当前会话启用组", "为当前会话禁用组", "同步正式规则",
+  ];
+
+  function driveMenu(component: any, target: string): void {
+    for (let index = 0; index < 50; index += 1) {
+      const lines = component.render?.(terminal.columns) ?? [];
+      const selected = lines.find((line: string) => line.includes("→ ")) ?? "";
+      if (selected.includes(target) || selected.includes(target.slice(0, 24))) {
+        component.handleInput?.("\x1b[C");
+        return;
+      }
+      component.handleInput?.("\x1b[B");
+    }
+    throw new Error(`menu target not found: ${target}`);
+  }
 
   const ui = {
     notify(message: string, level = "info") { notices.push({ message, level }); },
@@ -211,14 +338,41 @@ function harness(t: test.TestContext, options: HarnessOptions = {}) {
           renderedViews.push(initial);
           const isPicker = initial.some((line: string) => line.includes("选择最近对话"));
           const isLoader = component?.constructor?.name === "BorderedLoader";
-          const inputs = isPicker
-            ? pickerInputs.shift() ?? [" ", "\r"]
-            : isLoader
-              ? loaderInputs.shift() ?? []
-              : detailInputs.shift() ?? ["\x1b"];
-          for (const key of inputs) {
-            component.handleInput?.(key);
+          const isMenu = initial.some((line: string) => line.includes("Right/Enter 进入") || line.includes("→ 进入"));
+          if (isMenu) {
+            const rendered = initial.join("\n");
+            const menuTitle = String(initial[1] ?? "").trim();
+            const explicit = menuInputs.findIndex((item) => menuTitle === item.title || menuTitle.startsWith(`${item.title} ·`));
+            if (explicit >= 0) {
+              const [{ keys }] = menuInputs.splice(explicit, 1);
+              for (const key of keys) component.handleInput?.(key);
+            } else if (rendered.includes("个人偏好")) {
+              selects.push({ title: "个人偏好", choices: mainMenuChoices });
+              let target: string | undefined;
+              if (menuTarget) {
+                if (!menuSeen) {
+                  menuSeen = true;
+                  target = menuTarget;
+                }
+              } else {
+                target = options.selectReply?.("个人偏好", mainMenuChoices);
+              }
+              if (target) driveMenu(component, target);
+              else component.handleInput?.("\x1b[D");
+            } else {
+              component.handleInput?.("\x1b[C");
+            }
             renderedViews.push(component.render?.(terminal.columns) ?? []);
+          } else {
+            const inputs = isPicker
+              ? pickerInputs.shift() ?? [" ", "\r"]
+              : isLoader
+                ? loaderInputs.shift() ?? []
+                : detailInputs.shift() ?? ["\x1b"];
+            for (const key of inputs) {
+              component.handleInput?.(key);
+              renderedViews.push(component.render?.(terminal.columns) ?? []);
+            }
           }
         } catch (error) {
           rejectPromise(error);
@@ -265,7 +419,7 @@ function harness(t: test.TestContext, options: HarnessOptions = {}) {
     await handlers.get("session_start")?.({ reason: "startup" }, ctx);
   }
 
-  return {
+  const fixture = {
     root,
     ctx,
     events,
@@ -283,9 +437,16 @@ function harness(t: test.TestContext, options: HarnessOptions = {}) {
       component.handleInput?.(data);
       renderedViews.push(component.render?.(terminal.columns) ?? []);
     },
+    freshContext() {
+      return { ...ctx, ui: { ...ui } };
+    },
     async pref(args: string) {
       await start();
       await commands.get("pref")!.handler(args, ctx);
+    },
+    async prefWithContext(args: string, commandContext: Json) {
+      await start();
+      await commands.get("pref")!.handler(args, commandContext);
     },
     async completions(prefix: string) {
       await start();
@@ -302,10 +463,17 @@ function harness(t: test.TestContext, options: HarnessOptions = {}) {
       }
     },
     async shutdown(reason = "quit") {
-      await handlers.get("session_shutdown")?.({ reason }, ctx);
+      try {
+        await handlers.get("session_shutdown")?.({ reason }, ctx);
+      } catch (error) {
+        resourcesFor(t).cleanupFailures.push(error);
+        throw error;
+      }
     },
     handler(name: string) { return handlers.get(name); },
   };
+  resourcesFor(t).shutdowns.push(() => fixture.shutdown());
+  return fixture;
 }
 
 test("command parser and branch picker keep the bounded real-conversation contract", async () => {
@@ -344,6 +512,105 @@ test("command parser and branch picker keep the bounded real-conversation contra
   }) as any;
   assert.deepEqual(await selectConversationTurns(pickerCtx([" ", "\x1b[A", " ", "\x1b[B", " ", "\r"]), values), [values[0]]);
   assert.equal(await selectConversationTurns(pickerCtx(["\x1b"]), values), null);
+});
+
+test("C01/C03/H01 collects only final matching successful edit/write results in stable call order", () => {
+  const branch = [
+    ...successfulFileChangeBranch(),
+    { type: "message", message: { role: "user", content: [{ type: "text", text: "fallback edits" }] } },
+    { type: "message", message: {
+      role: "assistant",
+      content: [
+        { type: "toolCall", id: "edit-json", name: "edit", arguments: { path: "src/json.ts", edits: JSON.stringify([{ oldText: "before\n", newText: "after\n" }]), oldText: "legacy-before", newText: "legacy-after" } },
+        { type: "toolCall", id: "edit-object", name: "edit", arguments: { path: "src/object.ts", edits: { oldText: "object-before", newText: "object-after" } } },
+        { type: "toolCall", id: "write-empty", name: "write", arguments: { path: "empty.txt", content: "" } },
+      ],
+      stopReason: "toolUse",
+    } },
+    { type: "message", message: { role: "toolResult", toolCallId: "edit-ok", toolName: "edit", isError: false, details: { patch: "CROSS-TURN" } } },
+    { type: "message", message: { role: "toolResult", toolCallId: "edit-json", toolName: "edit", isError: false, details: {} } },
+    { type: "message", message: { role: "toolResult", toolCallId: "edit-object", toolName: "edit", isError: false, details: {} } },
+    { type: "message", message: { role: "toolResult", toolCallId: "write-empty", toolName: "write", isError: false, details: {} } },
+    { type: "message", message: { role: "assistant", content: [{ type: "text", text: "fallback done" }], stopReason: "stop" } },
+  ];
+  const turns = recentConversationTurns({ sessionManager: { getBranch: () => branch } } as any);
+  assert.equal(turns.length, 2);
+  assert.deepEqual(turns[0]!.file_changes?.map((item) => [item.tool, item.path]), [
+    ["edit", "src/a.ts"],
+    ["write", "notes.md"],
+  ]);
+  assert.equal(turns[0]!.file_changes![0]!.content, "@@ patch body @@");
+  assert.equal(turns[0]!.file_changes![1]!.content, "  line one\nsecret [REDACTED_CREDENTIAL]\n  ");
+  assert.doesNotMatch(JSON.stringify(turns), /DUPLICATE|fail\.ts|mismatch\.ts|missing\.md|CROSS-TURN|read-ignore/);
+  assert.match(turns[1]!.file_changes![0]!.content, /第 1 处修改前[\s\S]*before\n[\s\S]*第 1 处修改后[\s\S]*after\n/);
+  assert.match(turns[1]!.file_changes![0]!.content, /第 2 处修改前[\s\S]*legacy-before[\s\S]*第 2 处修改后[\s\S]*legacy-after/);
+  assert.match(turns[1]!.file_changes![1]!.content, /修改前[\s\S]*object-before[\s\S]*修改后[\s\S]*object-after/);
+  assert.deepEqual(turns[1]!.file_changes![2], { tool: "write", path: "empty.txt", content: "" });
+
+  const finalResults = recentConversationTurns({ sessionManager: { getBranch: () => [
+    { type: "message", message: { role: "user", content: [{ type: "text", text: "final results" }] } },
+    { type: "message", message: { role: "assistant", content: [
+      { type: "toolCall", id: "recover", name: "edit", arguments: { path: "recover.ts", oldText: "a", newText: "b" } },
+      { type: "toolCall", id: "mismatch", name: "edit", arguments: { path: "mismatch.ts", oldText: "a", newText: "b" } },
+      { type: "toolCall", id: "final-failure", name: "edit", arguments: { path: "final-failure.ts", oldText: "a", newText: "b" } },
+      { type: "toolCall", id: "last-success", name: "edit", arguments: { path: "last-success.ts", oldText: "a", newText: "b" } },
+    ], stopReason: "toolUse" } },
+    { type: "message", message: { role: "toolResult", toolCallId: "recover", toolName: "edit", isError: true, details: { patch: "FAILED-FIRST" } } },
+    { type: "message", message: { role: "toolResult", toolCallId: "recover", toolName: "edit", isError: false, details: { patch: "RECOVERED-LAST" } } },
+    { type: "message", message: { role: "toolResult", toolCallId: "mismatch", toolName: "write", isError: false, details: { patch: "WRONG-NAME" } } },
+    { type: "message", message: { role: "toolResult", toolCallId: "mismatch", toolName: "edit", isError: false, details: { patch: "MATCHED-LAST" } } },
+    { type: "message", message: { role: "toolResult", toolCallId: "final-failure", toolName: "edit", isError: false, details: { patch: "EARLY-SUCCESS" } } },
+    { type: "message", message: { role: "toolResult", toolCallId: "final-failure", toolName: "edit", isError: true, details: { patch: "FINAL-FAILURE" } } },
+    { type: "message", message: { role: "toolResult", toolCallId: "last-success", toolName: "edit", isError: false, details: { patch: "FIRST-SUCCESS" } } },
+    { type: "message", message: { role: "toolResult", toolCallId: "last-success", toolName: "edit", isError: false, details: { patch: "LAST-SUCCESS" } } },
+    { type: "message", message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" } },
+  ] } } as any);
+  assert.deepEqual(finalResults[0]!.file_changes, [
+    { tool: "edit", path: "recover.ts", content: "RECOVERED-LAST" },
+    { tool: "edit", path: "mismatch.ts", content: "MATCHED-LAST" },
+    { tool: "edit", path: "last-success.ts", content: "LAST-SUCCESS" },
+  ]);
+  assert.doesNotMatch(JSON.stringify(finalResults), /FAILED-FIRST|WRONG-NAME|EARLY-SUCCESS|FINAL-FAILURE|FIRST-SUCCESS|final-failure\.ts/);
+});
+
+test("C02/C05/C06 selected noncontinuous turns persist and send only their successful changes", async (t) => {
+  const middle = [
+    { type: "message", message: { role: "user", content: [{ type: "text", text: "middle unselected" }] } },
+    { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "middle-write", name: "write", arguments: { path: "middle.txt", content: "MIDDLE-UNSELECTED" } }], stopReason: "toolUse" } },
+    { type: "message", message: { role: "toolResult", toolCallId: "middle-write", toolName: "write", isError: false, details: {} } },
+    { type: "message", message: { role: "assistant", content: [{ type: "text", text: "middle done" }], stopReason: "stop" } },
+  ];
+  const last = [
+    { type: "message", message: { role: "user", content: [{ type: "text", text: "last selected" }] } },
+    { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "last-edit", name: "edit", arguments: { path: "last.ts", oldText: "old-last", newText: "new-last" } }], stopReason: "toolUse" } },
+    { type: "message", message: { role: "toolResult", toolCallId: "last-edit", toolName: "edit", isError: false, details: { diff: "LAST-SELECTED-DIFF" } } },
+    { type: "message", message: { role: "assistant", content: [{ type: "text", text: "last done" }], stopReason: "stop" } },
+  ];
+  const gate = deferred<ModelReply>();
+  const flow = harness(t, {
+    branch: [...successfulFileChangeBranch(), ...middle, ...last],
+    pickerInputs: [[" ", "\x1b[A", "\x1b[A", " ", "\r"]],
+    detailInputs: [["\x1b[D"]],
+    menuInputs: [
+      { title: "反馈与证据", keys: ["\x1b[C"] },
+      { title: "反馈与证据", keys: ["\x1b[D"] },
+    ],
+    modelReply: () => gate.promise,
+  });
+  await flow.pref("feedback --group global fix include successful changes");
+  assert.equal(flow.modelCalls, 1);
+  const saved = learning(flow.root).feedback[0];
+  assert.equal(saved.selected_turns.length, 2);
+  assert.deepEqual(saved.selected_turns.flatMap((turn: Json) => (turn.file_changes ?? []).map((item: Json) => item.path)), ["src/a.ts", "notes.md", "last.ts"]);
+  assert.match(flow.prompts[0]!, /@@ patch body @@|LAST-SELECTED-DIFF/);
+  assert.match(flow.prompts[0]!, /file_changes 是 Pi 已报告成功/);
+  assert.doesNotMatch(flow.prompts[0]!, /MIDDLE-UNSELECTED|middle\.txt/);
+  assert.ok(flow.renderedViews.flat().some((line) => line.includes("成功改动")));
+  gate.resolve(extraction("@@ patch body @@", { name: "global", certain: true, summary: "tool-backed evidence" }));
+  await waitFor(() => learning(flow.root).feedback[0]?.status === "organized", "tool-backed evidence organization");
+  assert.equal(learning(flow.root).evidence.length, 1);
+  await flow.menu("反馈与证据");
+  assert.match(flow.renderedViews.flat().join("\n"), /\[文件改动\] @@ patch body @@/);
 });
 
 function themeForTest() {
@@ -433,6 +700,84 @@ test("CLI persists the first extraction across processes and keeps old records r
   assert.equal(learning(root).feedback.find((item: Json) => item.id === invalid.feedback.id).extraction, null);
 });
 
+test("C04 validates file changes, preserves old missing fields, and enforces the shared size limit", async (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  const old = ok(root, ["feedback-create", "--stdin"], {
+    sentiment: "good", reason: "old record",
+    selected_turns: [{ user: "old user", assistant: "old assistant" }],
+    model: null, group: null,
+  });
+  const valid = ok(root, ["feedback-create", "--stdin"], {
+    sentiment: "fix", reason: "valid change",
+    selected_turns: [{
+      user: "u", assistant: "a",
+      file_changes: [{ tool: "write", path: "empty.txt", content: "" }],
+    }],
+    model: null, group: null,
+  });
+  assert.deepEqual(valid.feedback.selected_turns[0].file_changes, [{ tool: "write", path: "empty.txt", content: "" }]);
+  const storedOld = learning(root).feedback.find((item: Json) => item.id === old.feedback.id);
+  assert.equal(Object.hasOwn(storedOld.selected_turns[0], "file_changes"), false);
+  for (const change of [
+    { tool: "bash", path: "x", content: "bad" },
+    { tool: "edit", path: "", content: "bad" },
+    { tool: "edit", path: "x", content: "" },
+    { tool: "write", path: "x", content: 42 },
+  ]) {
+    const rejected = cli(root, ["feedback-create", "--stdin"], {
+      sentiment: "fix", reason: "invalid",
+      selected_turns: [{ user: "u", assistant: "a", file_changes: [change] }],
+      model: null, group: null,
+    });
+    assert.equal(rejected.ok, false);
+  }
+  const huge = "x".repeat(4 * 1024 * 1024);
+  const backendLarge = cli(root, ["feedback-create", "--stdin"], {
+    sentiment: "fix", reason: "too large",
+    selected_turns: [{ user: "u", assistant: "a", file_changes: [{ tool: "write", path: "huge.txt", content: huge }] }],
+    model: null, group: null,
+  });
+  assert.equal(backendLarge.ok, false);
+  assert.match(backendLarge.error.message, /4 MiB|exceeds/);
+
+  const branch = [
+    { type: "message", message: { role: "user", content: [{ type: "text", text: "large write" }] } },
+    { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "large", name: "write", arguments: { path: "huge.txt", content: huge } }], stopReason: "toolUse" } },
+    { type: "message", message: { role: "toolResult", toolCallId: "large", toolName: "write", isError: false, details: {} } },
+    { type: "message", message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" } },
+  ];
+  const frontend = harness(t, { branch });
+  await frontend.pref("feedback --group global fix too large");
+  assert.equal(frontend.modelCalls, 0);
+  assert.equal(learning(frontend.root).feedback.length, 0);
+  assert.ok(frontend.notices.some((item) => item.message.includes("超过") && item.message.includes("没有内容被截断")));
+});
+
+test("C06 rejects quotes from failed changes and cross-field concatenation", async (t) => {
+  const failedBranch = [
+    { type: "message", message: { role: "user", content: [{ type: "text", text: "failed change" }] } },
+    { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "failed-edit", name: "edit", arguments: { path: "x.ts", oldText: "FAILED-ONLY", newText: "new" } }], stopReason: "toolUse" } },
+    { type: "message", message: { role: "toolResult", toolCallId: "failed-edit", toolName: "edit", isError: true } },
+    { type: "message", message: { role: "assistant", content: [{ type: "text", text: "could not edit" }], stopReason: "stop" } },
+  ];
+  const failed = harness(t, { branch: failedBranch, modelReply: () => extraction("FAILED-ONLY") });
+  await failed.pref("feedback --group global fix failed tool quote");
+  await waitFor(() => learning(failed.root).feedback[0]?.status === "failed", "failed tool quote rejection");
+  assert.equal(learning(failed.root).evidence.length, 0);
+
+  const crossBranch = [
+    { type: "message", message: { role: "user", content: [{ type: "text", text: "USER-PART" }] } },
+    { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "cross-write", name: "write", arguments: { path: "x.txt", content: "TOOL-PART" } }], stopReason: "toolUse" } },
+    { type: "message", message: { role: "toolResult", toolCallId: "cross-write", toolName: "write", isError: false, details: {} } },
+    { type: "message", message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" } },
+  ];
+  const cross = harness(t, { branch: crossBranch, modelReply: () => extraction("USER-PARTTOOL-PART") });
+  await cross.pref("feedback --group global fix cross field quote");
+  await waitFor(() => learning(cross.root).feedback[0]?.status === "failed", "cross-field quote rejection");
+  assert.equal(learning(cross.root).evidence.length, 0);
+});
+
 test("candidate snapshots survive new evidence and review only their own evidence", (t) => {
   const root = temporaryRoot(t);
   ok(root, ["init"]);
@@ -458,6 +803,41 @@ test("candidate snapshots survive new evidence and review only their own evidenc
   const pending = ok(root, ["pending-list"]);
   assert.deepEqual(pending.evolution_groups.map((item: Json) => [item.name, item.new_evidence_count]), [["global", 3]]);
   assert.equal(ok(root, ["prepare-evolution", "--stdin"], { group: "global" }).evidence.length, 6);
+});
+
+test("C07 file changes do not alter evidence counts or leak wholesale into evolution input", (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  for (let index = 1; index <= 3; index += 1) {
+    const created = ok(root, ["feedback-create", "--stdin"], {
+      sentiment: "fix", reason: `reason-${index}`,
+      selected_turns: [{
+        user: `user-${index}`, assistant: `assistant-${index}`,
+        file_changes: [
+          { tool: "write", path: `file-${index}.txt`, content: `RAW-FILE-BODY-${index} NECESSARY-TOOL-QUOTE-${index}` },
+          { tool: "edit", path: `other-${index}.txt`, content: `UNQUOTED-RAW-CHANGE-${index}` },
+        ],
+      }],
+      model: { provider: "fake", id: "fake", thinking: "high" }, group: "global",
+    });
+    ok(root, ["feedback-extracted", "--stdin"], {
+      feedback_id: created.feedback.id,
+      extraction: extraction(`NECESSARY-TOOL-QUOTE-${index}`, { name: "global", certain: true, summary: `summary-${index}` }),
+      model: { provider: "fake", id: "fake", thinking: "high" },
+    });
+    ok(root, ["feedback-complete", "--stdin"], { feedback_id: created.feedback.id, group: "global" });
+  }
+  const stored = learning(root);
+  assert.equal(stored.feedback.length, 3);
+  assert.equal(stored.evidence.length, 3);
+  const prepared = ok(root, ["prepare-evolution", "--stdin"], { group: "global" });
+  assert.equal(prepared.trigger, true);
+  const projected = JSON.stringify(prepared.evidence);
+  for (let index = 1; index <= 3; index += 1) {
+    assert.match(projected, new RegExp(`NECESSARY-TOOL-QUOTE-${index}`));
+  }
+  assert.match(projected, /"role":"tool"/);
+  assert.doesNotMatch(projected, /RAW-FILE-BODY|UNQUOTED-RAW-CHANGE|file-1\.txt/);
 });
 
 test("R05/R07/R08 reprocess apply is atomic, conflict-safe, and invalidates only related candidates", (t) => {
@@ -686,11 +1066,9 @@ test("B02 dashboard feedback exits and empty or cancelled selection saves nothin
 });
 
 test("B03 uncertain extraction waits without dialogs and manual grouping reuses it", async (t) => {
-  let pendingSelections = 0;
   const flow = harness(t, {
     modelReply: () => extraction("selected-assistant-0", { name: null, certain: false, summary: "saved uncertain evidence" }),
-    selectReply: (title, choices) => {
-      if (title === "处理待办") { pendingSelections += 1; return choices[0]; }
+    selectReply: (title) => {
       if (title === "确定反馈所属组") return "global";
       return undefined;
     },
@@ -704,7 +1082,7 @@ test("B03 uncertain extraction waits without dialogs and manual grouping reuses 
   await flow.menu("处理待办");
   await waitFor(() => learning(flow.root).feedback[0]?.status === "organized", "manual grouping");
   assert.equal(flow.modelCalls, 1);
-  assert.equal(pendingSelections, 1);
+  assert.ok(flow.renderedViews.flat().some((line) => line.includes("处理待办")));
 });
 
 test("F01 expired explicit groups require a manual choice and keep the saved extraction", async (t) => {
@@ -801,6 +1179,123 @@ test("B04/B05 proposals stay noninteractive until pending review and six-evidenc
   assert.doesNotMatch(injected.systemPrompt, /evidence-|original-reason-|first three|all six/);
 });
 
+test("Q05 fresh same-generation contexts refresh status and report command parsing errors", async (t) => {
+  const flow = harness(t);
+  await flow.pref("");
+  const commandContext = flow.freshContext();
+  assert.notEqual(commandContext, flow.ctx);
+  const noticesBefore = flow.notices.length;
+  await flow.prefWithContext("feedback good", commandContext);
+  assert.equal(flow.notices.length, noticesBefore + 1);
+  assert.match(flow.notices.at(-1)!.message, /requires a reason/);
+  assert.equal(flow.notices.at(-1)!.level, "error");
+
+  const commandStatusCount = flow.statuses.length;
+  await flow.prefWithContext("", flow.freshContext());
+  assert.ok(flow.statuses.length > commandStatusCount);
+  const settledStatusCount = flow.statuses.length;
+  await flow.handler("agent_settled")!({}, flow.freshContext());
+  assert.ok(flow.statuses.length > settledStatusCount);
+});
+
+test("Q01/Q03 status refreshes drain every query before shutdown and root removal", async (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  const gate = writeStatusGateCli(root);
+  const previous = {
+    events: process.env.PI_PREF_STATUS_EVENTS,
+    allow: process.env.PI_PREF_STATUS_ALLOW,
+    fail: process.env.PI_PREF_STATUS_FAIL,
+  };
+  process.env.PI_PREF_STATUS_EVENTS = gate.events;
+  process.env.PI_PREF_STATUS_ALLOW = gate.allow;
+  process.env.PI_PREF_STATUS_FAIL = gate.failStatus;
+  writeFileSync(gate.allow, "allow\n");
+  const flow = harness(t, { root, preferenceCli: gate.script });
+  const startedFiles = () => readdirSync(gate.events).filter((name) => name.endsWith(".started"));
+  const closedFiles = () => readdirSync(gate.events).filter((name) => name.endsWith(".closed"));
+  const pidsFrom = (files: string[]) => files.map((name) => Number(name.split(".", 1)[0]));
+  try {
+    await flow.handler("session_start")!({ reason: "startup" }, flow.ctx);
+    const initialStarts = startedFiles().length;
+    assert.equal(initialStarts, 3);
+    unlinkSync(gate.allow);
+
+    writeFileSync(gate.failStatus, "fail\n");
+    const statusCount = flow.statuses.length;
+    let failedBatchSettled = false;
+    const failedBatch = flow.handler("agent_settled")!({}, flow.freshContext()).finally(() => { failedBatchSettled = true; });
+    await waitFor(() => startedFiles().length === initialStarts + 3, "controlled failed status batch start");
+    await waitFor(() => readdirSync(gate.events).some((name) => name.endsWith(".status.failed")), "controlled status failure");
+    assert.equal(failedBatchSettled, false);
+    assert.equal(flow.statuses.length, statusCount);
+    const failedBatchStarts = startedFiles().slice(initialStarts);
+    for (const pid of pidsFrom(failedBatchStarts)) writeFileSync(join(gate.events, `release-${pid}`), "release\n");
+    await failedBatch;
+    assert.equal(flow.statuses.at(-1), "偏好：状态异常");
+    assert.equal(closedFiles().length, initialStarts + 3);
+    assert.ok(pidsFrom(failedBatchStarts).every((pid) => !processExists(pid)));
+    unlinkSync(gate.failStatus);
+
+    const overlapStart = startedFiles().length;
+    const statusesBeforeShutdown = flow.statuses.length;
+    const firstRefresh = flow.handler("agent_settled")!({}, flow.freshContext());
+    const secondRefresh = flow.handler("agent_settled")!({}, flow.freshContext());
+    await waitFor(() => startedFiles().length === overlapStart + 6, "overlapping status refreshes");
+    const overlapFiles = startedFiles().slice(overlapStart);
+    await flow.shutdown("reload");
+    await Promise.all([firstRefresh, secondRefresh]);
+    assert.equal(flow.statuses.length, statusesBeforeShutdown);
+    assert.equal(closedFiles().length, overlapStart + 6);
+    assert.ok(pidsFrom(overlapFiles).every((pid) => !processExists(pid)));
+    rmSync(root, { recursive: true, force: true });
+    assert.equal(existsSync(root), false);
+  } finally {
+    if (previous.events === undefined) delete process.env.PI_PREF_STATUS_EVENTS;
+    else process.env.PI_PREF_STATUS_EVENTS = previous.events;
+    if (previous.allow === undefined) delete process.env.PI_PREF_STATUS_ALLOW;
+    else process.env.PI_PREF_STATUS_ALLOW = previous.allow;
+    if (previous.fail === undefined) delete process.env.PI_PREF_STATUS_FAIL;
+    else process.env.PI_PREF_STATUS_FAIL = previous.fail;
+  }
+});
+
+test("Q01 cleanup failures recorded before shutdown remain explicit and preserve fixture evidence", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "pi-pref-status-cleanup-error-"));
+  ok(root, ["init"]);
+  const script = join(root, "status-close.py");
+  writeFileSync(script, [
+    "import json, sys",
+    "command = sys.argv[1]",
+    "if command == 'status':",
+    "    value = {'ok': True, 'enabled': True, 'groups': 1, 'rules': 0, 'sync_state': 'clean', 'actionable_count': 0}",
+    "elif command == 'context':",
+    "    value = {'ok': True, 'effective_groups': ['global']}",
+    "else:",
+    "    value = {'ok': True, 'feedback': [], 'proposals': [], 'evolution_groups': []}",
+    "print(json.dumps(value), flush=True)",
+  ].join("\n"));
+  const flow = harness(t, { root, preferenceCli: script });
+  const originalKill = process.kill;
+  (process as any).kill = (target: number, signal?: NodeJS.Signals | number) => {
+    if (target < 0 && signal === 0) return true;
+    return originalKill(target, signal as NodeJS.Signals | number | undefined);
+  };
+  let startFailure: unknown;
+  try {
+    startFailure = await flow.handler("session_start")!({ reason: "startup" }, flow.ctx).then(() => undefined, (error: unknown) => error);
+  } finally {
+    (process as any).kill = originalKill;
+  }
+  assert.ok(startFailure instanceof PreferenceCliCleanupError);
+  const shutdownFailure = await flow.shutdown("reload").then(() => undefined, (error: unknown) => error);
+  assert.ok(shutdownFailure instanceof PreferenceCliCleanupError);
+  assert.equal(existsSync(root), true);
+  await flow.shutdown("reload");
+  resourcesFor(t).cleanupFailures.length = 0;
+  rmSync(root, { recursive: true, force: true });
+});
+
 test("B06 evidence changes during generation preserve data and leave regeneration pending", async (t) => {
   const evolutionGate = deferred<ModelReply>();
   let extractionCount = 0;
@@ -866,10 +1361,11 @@ test("R02 default evidence detail hides raw feedback metadata and reaches the mo
 
   const flow = harness(t, {
     root, terminalRows: 24, terminalColumns: 60,
-    detailInputs: [[...Array(30).fill("\x1b[6~"), "\x1b"]],
-    selectReply: (title, choices) => title === "反馈与证据"
-      ? choices.find((item) => item.includes(secondCreated.feedback.id.slice(-8)))
-      : undefined,
+    detailInputs: [[...Array(30).fill("\x1b[6~"), "\x1b[D"]],
+    menuInputs: [
+      { title: "反馈与证据", keys: ["\x1b[C"] },
+      { title: "反馈与证据", keys: ["\x1b[D"] },
+    ],
   });
   await flow.menu("反馈与证据");
   const rendered = flow.renderedViews.flat().join("\n");
@@ -881,13 +1377,27 @@ test("R02 default evidence detail hides raw feedback metadata and reaches the mo
   assert.doesNotMatch(rendered, new RegExp(first.id.slice(-8)));
 });
 
-test("R03/R04 reprocess blocks for a fresh model result and preserves data until explicit apply", async (t) => {
+test("R03/R04/H02 reprocess uses the exact saved change snapshot and previews tool quotes", async (t) => {
   const root = temporaryRoot(t);
   ok(root, ["init"]);
   const created = addCliEvidence(root, 1);
+  const withChanges = learning(root);
+  const storedFeedback = withChanges.feedback.find((item: Json) => item.id === created.id);
+  storedFeedback.selected_turns[0].file_changes = [
+    { tool: "write", path: "saved.md", content: "REPROCESS-SAVED-CHANGE\nSAVED-TOOL-QUOTE" },
+  ];
+  const savedTurns = JSON.parse(JSON.stringify(storedFeedback.selected_turns));
+  writeFileSync(join(root, "local/learning.json"), `${JSON.stringify(withChanges)}\n`);
+  writeFileSync(join(root, "saved.md"), "CURRENT-DISK-SENTINEL\n");
   const gate = deferred<ModelReply>();
   const flow = harness(t, {
     root,
+    branch: [
+      { type: "message", message: { role: "user", content: [{ type: "text", text: "CURRENT-BRANCH-USER" }] } },
+      { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "current-write", name: "write", arguments: { path: "saved.md", content: "CURRENT-BRANCH-CHANGE" } }], stopReason: "toolUse" } },
+      { type: "message", message: { role: "toolResult", toolCallId: "current-write", toolName: "write", isError: false, details: {} } },
+      { type: "message", message: { role: "assistant", content: [{ type: "text", text: "CURRENT-BRANCH-ASSISTANT" }], stopReason: "stop" } },
+    ],
     detailInputs: [["r"]],
     selectReply: (title, choices) => title === "重新整理反馈" ? choices[0] : undefined,
     modelReply: () => gate.promise,
@@ -900,11 +1410,16 @@ test("R03/R04 reprocess blocks for a fresh model result and preserves data until
   assert.match(flow.renderedViews.flat().join("\n"), /重新整理中，Esc 取消/);
   assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), before);
   assert.match(flow.prompts[0]!, /original reason 1|user-1|assistant-1/);
-  gate.resolve(extraction("quote-1", { name: "global", certain: true, summary: "fresh preview result" }));
+  const reprocessInput = JSON.parse(flow.prompts[0]!.split("\n\n").at(-1)!);
+  assert.deepEqual(reprocessInput.selected_turns, savedTurns);
+  assert.doesNotMatch(flow.prompts[0]!, /CURRENT-BRANCH-USER|CURRENT-BRANCH-CHANGE|CURRENT-BRANCH-ASSISTANT|CURRENT-DISK-SENTINEL/);
+  gate.resolve(extraction("SAVED-TOOL-QUOTE", { name: "global", certain: true, summary: "fresh preview result" }));
   await running;
   assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), before);
   assert.equal(flow.modelCalls, 1);
-  assert.ok(flow.renderedViews.flat().join("\n").includes("fresh preview result"));
+  const preview = flow.renderedViews.flat().join("\n");
+  assert.match(preview, /fresh preview result/);
+  assert.match(preview, /\[文件改动\] SAVED-TOOL-QUOTE/);
   assert.equal(ok(root, ["feedback-get", "--stdin"], { feedback_id: created.id }).feedback.status, "organized");
 
   const invalid = harness(t, {
@@ -1053,7 +1568,8 @@ test("G01 shutdown during delayed prepare prevents later model and UI startup", 
   const running = flow.menu("重新整理反馈");
   await waitFor(() => existsSync(startedFile), "delayed prepare start");
   assert.equal(flow.modelCalls, 0);
-  assert.equal(flow.events.filter((item) => item === "custom").length, 0);
+  const uiCount = flow.events.filter((item) => item === "custom").length;
+  assert.equal(uiCount, 2);
   const notices = flow.notices.length;
   const shutdownStarted = Date.now();
   await flow.shutdown("reload");
@@ -1062,7 +1578,7 @@ test("G01 shutdown during delayed prepare prevents later model and UI startup", 
   await running;
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
   assert.equal(flow.modelCalls, 0);
-  assert.equal(flow.events.filter((item) => item === "custom").length, 0);
+  assert.equal(flow.events.filter((item) => item === "custom").length, uiCount);
   assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), before);
   assert.equal(flow.notices.length, notices);
 });
@@ -1085,6 +1601,7 @@ test("R10 reprocess cancel and shutdown discard ignored-abort late responses", a
   const running = shutdownFlow.menu("重新整理反馈");
   await waitFor(() => shutdownFlow.modelCalls === 1, "reprocess model before shutdown");
   const noticeCount = shutdownFlow.notices.length;
+  const shutdownUiCount = shutdownFlow.events.filter((item) => item === "custom").length;
   const started = Date.now();
   await shutdownFlow.shutdown("reload");
   assert.ok(Date.now() - started < 1_000);
@@ -1093,7 +1610,7 @@ test("R10 reprocess cancel and shutdown discard ignored-abort late responses", a
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
   assert.equal(readFileSync(join(shutdownRoot, "local/learning.json"), "utf8"), beforeShutdown);
   assert.equal(shutdownFlow.notices.length, noticeCount);
-  assert.equal(shutdownFlow.events.filter((item) => item === "custom").length, 1);
+  assert.equal(shutdownFlow.events.filter((item) => item === "custom").length, shutdownUiCount);
 
   const escapeRoot = temporaryRoot(t);
   ok(escapeRoot, ["init"]);
@@ -1310,6 +1827,166 @@ test("Git/file failures and concurrent rule changes preserve the old groups docu
   assert.doesNotMatch(dispatchBody, /_stdin_object\(/);
 });
 
+test("Q02/Q04 CLI abort, timeout, and orphaned descendants settle only after process closure", async (t) => {
+  const root = temporaryRoot(t);
+  const hanging = join(root, "hanging-cli.py");
+  writeFileSync(hanging, [
+    "import os, time",
+    "with open(os.environ['PI_PREF_PID_FILE'], 'w', encoding='utf-8') as handle:",
+    "    handle.write(str(os.getpid()))",
+    "while True:",
+    "    time.sleep(1)",
+  ].join("\n"));
+
+  const abortPidFile = join(root, "abort.pid");
+  const abortController = new AbortController();
+  const aborted = runPreferenceCli(hanging, root, [], undefined, 10_000, { PI_PREF_PID_FILE: abortPidFile }, abortController.signal);
+  await waitFor(() => existsSync(abortPidFile), "abort CLI pid");
+  const abortPid = Number(readFileSync(abortPidFile, "utf8"));
+  abortController.abort();
+  await assert.rejects(aborted, /CLI aborted/);
+  assert.equal(processExists(abortPid), false);
+
+  const timeoutPidFile = join(root, "timeout.pid");
+  const timedOut = runPreferenceCli(hanging, root, [], undefined, 500, { PI_PREF_PID_FILE: timeoutPidFile });
+  await waitFor(() => existsSync(timeoutPidFile), "timeout CLI pid");
+  const timeoutPid = Number(readFileSync(timeoutPidFile, "utf8"));
+  await assert.rejects(timedOut, /CLI timed out/);
+  assert.equal(processExists(timeoutPid), false);
+
+  const descendantPidFile = join(root, "descendant.pid");
+  const forking = join(root, "forking-cli.py");
+  writeFileSync(forking, [
+    "import json, os, signal, time",
+    "pid_file = os.environ['PI_PREF_DESCENDANT_PID_FILE']",
+    "child = os.fork()",
+    "if child == 0:",
+    "    devnull = os.open(os.devnull, os.O_RDWR)",
+    "    for descriptor in (0, 1, 2):",
+    "        os.dup2(devnull, descriptor)",
+    "    signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+    "    with open(pid_file, 'w', encoding='utf-8') as handle:",
+    "        handle.write(str(os.getpid()))",
+    "    while True:",
+    "        signal.pause()",
+    "while not os.path.exists(pid_file):",
+    "    time.sleep(0.01)",
+    "print(json.dumps({'ok': True, 'parent': os.getpid()}), flush=True)",
+  ].join("\n"));
+  const forked = await runPreferenceCli(forking, root, [], undefined, 10_000, { PI_PREF_DESCENDANT_PID_FILE: descendantPidFile });
+  const descendantPid = Number(readFileSync(descendantPidFile, "utf8"));
+  assert.equal(forked.ok, true);
+  assert.equal(processExists(descendantPid), false);
+});
+
+test("Q06 parent exit always bounds close without signaling a setsid stdio holder", async (t) => {
+  const root = temporaryRoot(t);
+  const script = join(root, "setsid-holder-cli.py");
+  writeFileSync(script, [
+    "import json, os, signal, time",
+    "release = os.environ['PI_PREF_HOLDER_RELEASE']",
+    "pid_file = os.environ['PI_PREF_HOLDER_PID']",
+    "parent_exit = os.environ['PI_PREF_PARENT_EXIT']",
+    "child = os.fork()",
+    "if child == 0:",
+    "    os.setsid()",
+    "    signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+    "    with open(pid_file, 'w', encoding='utf-8') as handle:",
+    "        handle.write(str(os.getpid()))",
+    "    while not os.path.exists(release):",
+    "        time.sleep(0.01)",
+    "    raise SystemExit(0)",
+    "while not os.path.exists(pid_file):",
+    "    time.sleep(0.01)",
+    "with open(parent_exit, 'w', encoding='utf-8') as handle:",
+    "    handle.write(str(os.getpid()))",
+    "print(json.dumps({'ok': True}), flush=True)",
+  ].join("\n"));
+
+  const withinRelease = join(root, "within.release");
+  const withinPidFile = join(root, "within.pid");
+  const withinParentExit = join(root, "within.parent-exit");
+  const within = runPreferenceCli(script, root, [], undefined, 10_000, {
+    PI_PREF_HOLDER_RELEASE: withinRelease,
+    PI_PREF_HOLDER_PID: withinPidFile,
+    PI_PREF_PARENT_EXIT: withinParentExit,
+  });
+  await waitFor(() => existsSync(withinPidFile) && existsSync(withinParentExit), "within-deadline setsid holder");
+  const withinPid = Number(readFileSync(withinPidFile, "utf8"));
+  assert.equal(processExists(withinPid), true);
+  writeFileSync(withinRelease, "release\n");
+  assert.equal((await within).ok, true);
+  assert.equal(processExists(withinPid), false);
+
+  const overdueRelease = join(root, "overdue.release");
+  const overduePidFile = join(root, "overdue.pid");
+  const overdueParentExit = join(root, "overdue.parent-exit");
+  const overdue = runPreferenceCli(script, root, [], undefined, 200, {
+    PI_PREF_HOLDER_RELEASE: overdueRelease,
+    PI_PREF_HOLDER_PID: overduePidFile,
+    PI_PREF_PARENT_EXIT: overdueParentExit,
+  });
+  await waitFor(() => existsSync(overduePidFile) && existsSync(overdueParentExit), "overdue setsid holder");
+  const overduePid = Number(readFileSync(overduePidFile, "utf8"));
+  const closeStarted = Date.now();
+  let watchdog: NodeJS.Timeout | undefined;
+  let failure: unknown;
+  try {
+    failure = await Promise.race([
+      overdue.then(() => new Error("setsid holder unexpectedly completed"), (error) => error),
+      new Promise<Error>((resolvePromise) => {
+        watchdog = setTimeout(() => resolvePromise(new Error("setsid holder close deadline was not enforced")), 1_500);
+      }),
+    ]);
+    assert.ok(failure instanceof PreferenceCliCleanupError, String(failure));
+    assert.ok(Date.now() - closeStarted < 1_300);
+    assert.equal(processExists(overduePid), true);
+  } finally {
+    if (watchdog) clearTimeout(watchdog);
+    writeFileSync(overdueRelease, "release\n");
+    await waitFor(() => !processExists(overduePid), "released overdue setsid holder");
+  }
+});
+
+test("Q02 cleanup timeout is explicit and preserves its root until controlled recovery", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-pref-cleanup-error-"));
+  const script = join(root, "cleanup-timeout.py");
+  const pidFile = join(root, "child.pid");
+  writeFileSync(script, [
+    "import os, time",
+    "with open(os.environ['PI_PREF_PID_FILE'], 'w', encoding='utf-8') as handle:",
+    "    handle.write(str(os.getpid()))",
+    "while True:",
+    "    time.sleep(1)",
+  ].join("\n"));
+  const controller = new AbortController();
+  const running = runPreferenceCli(script, root, [], undefined, 10_000, { PI_PREF_PID_FILE: pidFile }, controller.signal);
+  await waitFor(() => existsSync(pidFile), "cleanup timeout CLI pid");
+  const pid = Number(readFileSync(pidFile, "utf8"));
+  const originalKill = process.kill;
+  let ownedGroup: number | null = null;
+  (process as any).kill = (target: number, signal?: NodeJS.Signals | number) => {
+    if (target < 0) {
+      if (ownedGroup === null && signal !== 0) ownedGroup = -target;
+      if (ownedGroup === -target && signal === 0) return true;
+    }
+    return originalKill(target, signal as NodeJS.Signals | number | undefined);
+  };
+  let failure: unknown;
+  try {
+    controller.abort();
+    failure = await running.then(() => undefined, (error) => error);
+  } finally {
+    (process as any).kill = originalKill;
+  }
+  assert.ok(failure instanceof PreferenceCliCleanupError);
+  assert.match(failure.message, /did not close within 1 second/);
+  assert.match(failure.primaryError?.message ?? "", /CLI aborted/);
+  assert.equal(existsSync(root), true);
+  assert.equal(processExists(pid), false);
+  rmSync(root, { recursive: true, force: true });
+});
+
 test("CLI decoding preserves UTF-8 characters split across stdout chunks", async (t) => {
   const root = temporaryRoot(t);
   const script = join(root, "split-output.py");
@@ -1322,6 +1999,212 @@ test("CLI decoding preserves UTF-8 characters split across stdout chunks", async
   ].join("\n"));
   const result = await runPreferenceCli(script, root, []);
   assert.equal(result.text, "你");
+});
+
+test("N01 real menu keys preserve main and group-rule positions without pseudo rows", async (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  ok(root, ["remember", "--stdin"], { group: "global", rule: "menu-rule" });
+  const flow = harness(t, {
+    root,
+    terminalRows: 8,
+    terminalColumns: 40,
+    menuInputs: [
+      { title: "个人偏好", keys: [...Array(6).fill("\x1b[B"), "\x1b[C"] },
+      { title: "管理偏好组", keys: [...Array(4).fill("\x1b[B"), "\x1b[C"] },
+      { title: "管理组内规则", keys: ["\x1b[B", "\x1b[C"] },
+      { title: "管理组内规则", keys: ["\x1b[D"] },
+      { title: "管理偏好组", keys: ["\x1b[D"] },
+      { title: "个人偏好", keys: ["\x1b[D"] },
+    ],
+    selectReply: (title, choices) => title === "选择偏好组" || title === "选择规则" ? choices[0] : undefined,
+  });
+  await flow.pref("");
+  const views = flow.renderedViews;
+  assert.ok(views.some((view) => view.some((line) => line.includes("→ 管理组与规则"))));
+  assert.ok(views.some((view) => view.some((line) => line.includes("→ 管理规则"))));
+  assert.ok(views.some((view) => view.some((line) => line.includes("→ 修改"))));
+  assert.equal(views.flat().some((line) => /→\s*(返回|退出)/u.test(line)), false);
+  assert.ok(views.flat().every((line) => visibleWidth(line) <= 40));
+});
+
+test("N02 evidence navigation remembers stable IDs and safely falls back after deletion", async (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  const older = addCliEvidence(root, 1);
+  const newer = addCliEvidence(root, 2);
+  const labeled = learning(root);
+  labeled.feedback.find((item: Json) => item.id === older.id).reason = "OLD-REMOVED";
+  labeled.feedback.find((item: Json) => item.id === newer.id).reason = "NEW-REMAINING";
+  labeled.feedback.forEach((item: Json) => { item.created_at = "t"; });
+  writeFileSync(join(root, "local/learning.json"), `${JSON.stringify(labeled)}\n`);
+  const flow = harness(t, {
+    root,
+    detailInputs: [[]],
+    menuInputs: [
+      { title: "个人偏好", keys: ["\x1b[B", "\x1b[B", "\x1b[C"] },
+      { title: "反馈与证据", keys: ["\x1b[B", "\x1b[C"] },
+      { title: "反馈与证据", keys: ["\x1b[D"] },
+      { title: "个人偏好", keys: ["\x1b[D"] },
+    ],
+  });
+  const running = flow.pref("");
+  await waitFor(() => flow.renderedViews.flat().some((line) => line.includes("evidence 1")), "older evidence detail");
+  const document = learning(root);
+  document.feedback = document.feedback.filter((item: Json) => item.id !== older.id);
+  document.evidence = document.evidence.filter((item: Json) => item.feedback_id !== older.id);
+  writeFileSync(join(root, "local/learning.json"), `${JSON.stringify(document)}\n`);
+  flow.sendLastCustom("\x1b[D");
+  await running;
+  const listViews = flow.renderedViews.filter((view) => view.some((line) => line.trim() === "反馈与证据") && view.some((line) => line.includes("→ ")));
+  assert.ok(listViews.at(-1)!.some((line) => line.includes("NEW-REMAINING")));
+  assert.equal(learning(root).feedback.length, 1);
+  assert.equal(learning(root).evidence.length, 1);
+});
+
+test("N02 resource cancellation returns to its menu without writing", async (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  const before = readFileSync(join(root, "repo/groups.json"), "utf8");
+  const flow = harness(t, {
+    root,
+    menuInputs: [
+      { title: "个人偏好", keys: [...Array(6).fill("\x1b[B"), "\x1b[C"] },
+      { title: "管理偏好组", keys: ["\x1b[B", "\x1b[B", "\x1b[B", "\x1b[C"] },
+      { title: "管理偏好组", keys: ["\x1b[D"] },
+      { title: "个人偏好", keys: ["\x1b[D"] },
+    ],
+    selectReply: () => undefined,
+  });
+  await flow.pref("");
+  assert.equal(readFileSync(join(root, "repo/groups.json"), "utf8"), before);
+});
+
+test("N03 feedback selection Left returns to the remembered main item without saving", async (t) => {
+  const flow = harness(t, {
+    pickerInputs: [["\x1b[D"]],
+    inputReplies: ["cancel before save"],
+    menuInputs: [
+      { title: "个人偏好", keys: ["\x1b[B", "\x1b[C"] },
+      { title: "个人偏好", keys: ["\x1b[D"] },
+    ],
+    selectReply: (title) => title === "评价助手结果" ? "good" : undefined,
+  });
+  await flow.pref("");
+  assert.equal(flow.modelCalls, 0);
+  assert.equal(learning(flow.root).feedback.length, 0);
+  assert.ok(flow.renderedViews.some((view) => view.some((line) => line.includes("→ 记录反馈"))));
+});
+
+test("N03 Left cancels details and Right never applies confirmation actions", async (t) => {
+  const proposalRoot = temporaryRoot(t);
+  ok(proposalRoot, ["init"]);
+  for (let index = 1; index <= 3; index += 1) addCliEvidence(proposalRoot, index);
+  const prepared = ok(proposalRoot, ["prepare-evolution", "--stdin"], { group: "global" });
+  ok(proposalRoot, ["save-evolution", "--stdin"], {
+    group_id: prepared.group.id, base_digest: prepared.base_digest, evidence_digest: prepared.evidence_digest,
+    evidence_ids: prepared.evidence.map((item: Json) => item.id), proposed_rules: ["not-applied"], rationale: "right ignored",
+  });
+  const proposalFlow = harness(t, {
+    root: proposalRoot,
+    detailInputs: [["\x1b[C", "\x1b[D"]],
+    menuInputs: [
+      { title: "个人偏好", keys: [...Array(4).fill("\x1b[B"), "\x1b[C"] },
+      { title: "处理待办", keys: ["\x1b[C"] },
+      { title: "个人偏好", keys: ["\x1b[D"] },
+    ],
+  });
+  await proposalFlow.pref("");
+  assert.equal(learning(proposalRoot).proposals.at(-1).status, "pending");
+  assert.equal(groups(proposalRoot).groups[0].rules.length, 0);
+
+  const reprocessRoot = temporaryRoot(t);
+  ok(reprocessRoot, ["init"]);
+  addCliEvidence(reprocessRoot, 1);
+  const before = readFileSync(join(reprocessRoot, "local/learning.json"), "utf8");
+  const reprocessFlow = harness(t, {
+    root: reprocessRoot,
+    detailInputs: [["\x1b[C", "\x1b[D"]],
+    menuInputs: [
+      { title: "个人偏好", keys: ["\x1b[B", "\x1b[B", "\x1b[B", "\x1b[C"] },
+      { title: "重新整理反馈", keys: ["\x1b[C"] },
+    ],
+    modelReply: () => extraction("quote-1", { summary: "right must not apply" }),
+  });
+  await reprocessFlow.pref("");
+  assert.equal(readFileSync(join(reprocessRoot, "local/learning.json"), "utf8"), before);
+  assert.equal(reprocessFlow.modelCalls, 1);
+});
+
+test("H03 MenuSession Enter selects while Esc and Ctrl+C preserve position without actions", async () => {
+  let component: any;
+  const session = new MenuSession({
+    mode: "tui",
+    ui: {
+      custom(factory: Function) {
+        return new Promise((resolvePromise) => {
+          component = factory({ requestRender() {}, terminal: { rows: 10, columns: 60 } }, themeForTest(), {}, resolvePromise);
+        });
+      },
+    },
+  } as any);
+  const items = [
+    { value: "first", label: "First" },
+    { value: "second", label: "Second" },
+    { value: "third", label: "Third" },
+  ];
+  const actions: string[] = [];
+
+  const enteredPromise = session.select("keys", "Key Menu", items);
+  component.handleInput("\x1b[B");
+  component.handleInput("\r");
+  const entered = await enteredPromise;
+  if (entered) actions.push(entered);
+  assert.equal(entered, "second");
+
+  const escapedPromise = session.select("keys", "Key Menu", items);
+  assert.ok(component.render(60).some((line: string) => line.includes("→ Second")));
+  component.handleInput("\x1b");
+  const escaped = await escapedPromise;
+  if (escaped) actions.push(escaped);
+  assert.equal(escaped, undefined);
+
+  const ctrlCPromise = session.select("keys", "Key Menu", items);
+  assert.ok(component.render(60).some((line: string) => line.includes("→ Second")));
+  component.handleInput("\x03");
+  const ctrlC = await ctrlCPromise;
+  if (ctrlC) actions.push(ctrlC);
+  assert.equal(ctrlC, undefined);
+  assert.deepEqual(actions, ["second"]);
+});
+
+test("N04 short menus keep the selected row visible and RPC uses native select", async () => {
+  let component: any;
+  const tuiResult = new MenuSession({
+    mode: "tui",
+    ui: {
+      custom(factory: Function) {
+        return new Promise((resolvePromise) => {
+          component = factory({ requestRender() {}, terminal: { rows: 7, columns: 28 } }, themeForTest(), {}, resolvePromise);
+        });
+      },
+    },
+  } as any).select("short", "Short Menu", Array.from({ length: 20 }, (_, index) => ({ value: `item-${index}`, label: `Long item ${index} with text` })));
+  for (let index = 0; index < 15; index += 1) component.handleInput("\x1b[B");
+  const lines = component.render(28);
+  assert.ok(lines.some((line: string) => line.includes("→ ")));
+  assert.ok(lines.length <= 7);
+  assert.ok(lines.every((line: string) => visibleWidth(line) <= 28));
+  component.handleInput("\x1b[C");
+  assert.equal(await tuiResult, "item-15");
+
+  let nativeCalls = 0;
+  const rpc = await new MenuSession({
+    mode: "rpc",
+    ui: { async select(_title: string, choices: string[]) { nativeCalls += 1; return choices[1]; } },
+  } as any).select("rpc", "RPC Menu", [{ value: "one", label: "One" }, { value: "two", label: "Two" }]);
+  assert.equal(rpc, "two");
+  assert.equal(nativeCalls, 1);
 });
 
 test("B12 preference status stays compact while the footer preserves Pi and extension information", () => {
