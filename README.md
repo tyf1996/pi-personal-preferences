@@ -83,6 +83,8 @@ ${PI_CODING_AGENT_DIR:-~/.pi/agent}/personal-preferences/
 
 “反馈与证据”默认只展示模型证据：摘要、助手实际行为、用户期望、适用范围及带角色的支持引文。引文可来自所选 user、assistant 或成功文件改动正文，文件改动来源显示为“文件改动”。原评价理由、模型配置、完整所选对话和整份补丁继续保存在本机，但不默认拼入结果视图。
 
+在该列表按 Space 可编辑当前反馈的 `good`／`fix` 类型与完整理由。类型先暂存在内存，随后由 Pi 原生多行编辑器预填原理由；提交编辑器即覆盖保存，不再增加确认屏。取消、无变化或校验失败不会写入或调用模型。已有证据继续保留并提示主动重新整理；尚未形成证据时清除旧评价产生的 extraction/error，等待用户主动继续。三个反馈列表中的理由只在标签中归一为空格，保存正文和后续模型输入保持完整。
+
 所有已保存反馈都可从 `/pref → 重新整理反馈` 主动重新整理。该流程使用原评价、完整理由、原样保存的新 events 或旧轮次快照和操作开始时的当前 Pi 模型，阻塞等待一次新的提取调用；已有 extraction 也不会复用旧结果冒充重新整理。新结果先以只读滚动视图预览，只有明确确认才原位覆盖：
 
 - 保留或 Esc：原反馈、证据、候选和规则不变。
@@ -149,7 +151,8 @@ local/learning.json
 - 模型输出在写入前按固定契约校验；新格式引文必须完整来自单个 user/assistant 事件或单条成功 result，不能来自 path、call_id 或跨事件拼接。旧格式继续按单字段校验；展示和规则演化派生 `user`、`assistant`、`both`、`tool` 或 `unknown` 角色。
 - CLI 使用流式 UTF-8 解码，跨 stdout/stderr chunk 的多字节字符保持完整。abort、timeout 和 I/O 错误会保留首错，并在父进程 close 且自有 POSIX 进程组消失后才结束；500ms 后可升级 SIGKILL，1 秒仍未关闭时明确抛出 `PreferenceCliCleanupError`。
 - 规则写入前检查偏好仓库状态；Git 失败时恢复旧 `groups.json`，push 失败时保留本机提交。
-- 后台 Promise、主动重新整理和状态刷新都归当前 session 生命周期所有。shutdown/reload 会停止新刷新、取消并排空已启动查询；关闭后不操作旧 UI。资源无法在内部上界内关闭时 shutdown 明确失败，不静默继续清理数据根。
+- 后台 Promise、主动重新整理、评价编辑的列表/CLI/类型选择和状态刷新都归当前 session 生命周期所有。shutdown/reload 会停止新刷新并取消已启动查询；Pi 原生 editor 没有 signal 参数，宿主编辑器本身不会被冒充为已取消，但其返回后会重新检查存活，关闭后不保存或操作旧 UI。资源无法在内部上界内关闭时 shutdown 明确失败，不静默继续清理数据根。
+- 评价编辑在短锁内比较打开编辑时的 `{sentiment,reason}`，再以一次原子写覆盖；并发评价变化会拒绝。`feedback-extracted`、`feedback-complete` 和 `feedback-fail` 同样携带任务开始时的评价，旧成功或失败回调不能污染新评价。
 - 重新整理的 prepare 不改业务记录；确认 apply 在一个短锁内校验反馈／旧证据快照和目标组 digest，并原子更新 `learning.json`。
 - 手动演化 prepare 同时绑定目标组与所选证据投影，前后端均执行 4 MiB 门禁；apply 复核组和所选证据 digest，只修改正式规则/Git。未选证据变化不误阻止应用。
 - 正式规则只在当前有效组中注入，并低于安全、正确性、用户当前请求和 `AGENTS.md`；反馈、证据和未确认候选不通过消息 API 进入日常模型上下文。

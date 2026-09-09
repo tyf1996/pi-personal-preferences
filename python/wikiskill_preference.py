@@ -347,12 +347,30 @@ def _extraction_group(store: PreferenceStore, feedback: dict[str, Any]) -> str |
     return None
 
 
+def _evaluation(value: Any, label: str) -> dict[str, str]:
+    data = _strict(value, {"sentiment", "reason"}, {"sentiment", "reason"}, label)
+    if data["sentiment"] not in {"good", "fix"}:
+        raise PreferenceValidationError(f"{label}.sentiment must be good or fix")
+    return {
+        "sentiment": data["sentiment"],
+        "reason": checked_text(data["reason"], f"{label}.reason", maximum=4000),
+    }
+
+
+def _feedback_evaluation(feedback: dict[str, Any]) -> dict[str, str]:
+    return {"sentiment": feedback["sentiment"], "reason": feedback["reason"]}
+
+
 def _feedback_extracted(store: PreferenceStore, value: dict[str, Any]) -> dict[str, Any]:
-    data = _strict(value, {"feedback_id", "extraction", "model"}, {"feedback_id", "extraction", "model"}, "feedback-extracted")
+    fields = {"feedback_id", "expected_evaluation", "extraction", "model"}
+    data = _strict(value, fields, fields, "feedback-extracted")
+    expected = _evaluation(data["expected_evaluation"], "expected_evaluation")
     model = validate_model(data["model"])
     with store.locked():
         learning = store.learning()
         feedback = store.require_feedback(learning, data["feedback_id"])
+        if _feedback_evaluation(feedback) != expected:
+            return {"ok": True, "stale": True, "feedback": feedback}
         if feedback["status"] != "organized":
             changed = False
             if feedback.get("extraction") is None:
@@ -374,11 +392,14 @@ def _feedback_extracted(store: PreferenceStore, value: dict[str, Any]) -> dict[s
 
 
 def _feedback_fail(store: PreferenceStore, value: dict[str, Any]) -> dict[str, Any]:
-    data = _strict(value, {"feedback_id"}, {"feedback_id", "error"}, "feedback-fail")
+    data = _strict(value, {"feedback_id", "expected_evaluation"}, {"feedback_id", "expected_evaluation", "error"}, "feedback-fail")
+    expected = _evaluation(data["expected_evaluation"], "expected_evaluation")
     error = checked_text(data.get("error", "模型整理失败"), "feedback.error", maximum=500)
     with store.locked():
         learning = store.learning()
         feedback = store.require_feedback(learning, data["feedback_id"])
+        if _feedback_evaluation(feedback) != expected:
+            return {"ok": True, "stale": True, "feedback": feedback}
         if feedback["status"] != "organized":
             feedback["status"] = "failed"
             feedback["error"] = error
@@ -387,11 +408,14 @@ def _feedback_fail(store: PreferenceStore, value: dict[str, Any]) -> dict[str, A
 
 
 def _feedback_complete(store: PreferenceStore, value: dict[str, Any]) -> dict[str, Any]:
-    data = _strict(value, {"feedback_id", "group"}, {"feedback_id", "group"}, "feedback-complete")
+    data = _strict(value, {"feedback_id", "expected_evaluation", "group"}, {"feedback_id", "expected_evaluation", "group"}, "feedback-complete")
+    expected = _evaluation(data["expected_evaluation"], "expected_evaluation")
     group_name = checked_text(data["group"], "group", maximum=128)
     with store.locked():
         learning = store.learning()
         feedback = store.require_feedback(learning, data["feedback_id"])
+        if _feedback_evaluation(feedback) != expected:
+            return {"ok": True, "stale": True, "feedback": feedback}
         if feedback.get("evidence_id"):
             existing = next(item for item in learning["evidence"] if item.get("id") == feedback["evidence_id"])
             return {"ok": True, "feedback": feedback, "evidence": existing, "duplicate": True}
@@ -421,6 +445,39 @@ def _feedback_complete(store: PreferenceStore, value: dict[str, Any]) -> dict[st
         feedback["error"] = None
         store.write_learning(learning)
     return {"ok": True, "feedback": feedback, "evidence": evidence, "duplicate": False}
+
+
+def _feedback_edit_evaluation(store: PreferenceStore, value: dict[str, Any]) -> dict[str, Any]:
+    fields = {"feedback_id", "expected_evaluation", "sentiment", "reason"}
+    data = _strict(value, fields, fields, "feedback-edit-evaluation")
+    expected = _evaluation(data["expected_evaluation"], "expected_evaluation")
+    updated_evaluation = _evaluation({"sentiment": data["sentiment"], "reason": data["reason"]}, "evaluation")
+    with store.locked():
+        learning = store.learning()
+        feedback = store.require_feedback(learning, data["feedback_id"])
+        if _feedback_evaluation(feedback) != expected:
+            return {"ok": True, "stale": True, "feedback": feedback}
+        if _feedback_evaluation(feedback) == updated_evaluation:
+            return {"ok": True, "changed": False, "feedback": feedback, "invalidated_proposal_count": 0}
+        evidence_id = feedback.get("evidence_id")
+        updated_feedback = {**feedback, **updated_evaluation}
+        if evidence_id is None:
+            updated_feedback.update({"status": "saved", "extraction": None, "error": None})
+        learning["feedback"] = [updated_feedback if item["id"] == feedback["id"] else item for item in learning["feedback"]]
+        invalidated = 0
+        if evidence_id is not None:
+            for proposal in learning["proposals"]:
+                if proposal["status"] == "pending" and evidence_id in proposal["evidence_ids"]:
+                    proposal["status"] = "stale"
+                    proposal["resolved_at"] = utc_now()
+                    invalidated += 1
+        store.write_learning(learning)
+    return {
+        "ok": True,
+        "changed": True,
+        "feedback": updated_feedback,
+        "invalidated_proposal_count": invalidated,
+    }
 
 
 def _feedback_get(store: PreferenceStore, value: dict[str, Any]) -> dict[str, Any]:
@@ -845,6 +902,8 @@ def dispatch(args: argparse.Namespace, stdin_value: dict[str, Any] | None) -> di
         return _feedback_get(store, stdin_value or {})
     if args.command == "feedback-list":
         return _feedback_list(store)
+    if args.command == "feedback-edit-evaluation":
+        return _feedback_edit_evaluation(store, stdin_value or {})
     if args.command == "feedback-reprocess":
         return _feedback_reprocess(store, stdin_value or {})
     if args.command == "pending-list":
@@ -864,7 +923,7 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Pi personal preference backend")
     result.add_argument("command", choices=[
         "init", "status", "groups", "context", "remember", "manage-group", "set-activation", "sync",
-        "feedback-create", "feedback-extracted", "feedback-fail", "feedback-complete", "feedback-get", "feedback-list", "feedback-reprocess", "pending-list",
+        "feedback-create", "feedback-extracted", "feedback-fail", "feedback-complete", "feedback-get", "feedback-list", "feedback-edit-evaluation", "feedback-reprocess", "pending-list",
         "manual-evolution", "prepare-evolution", "save-evolution", "resolve-evolution",
     ])
     result.add_argument("--stdin", action="store_true")

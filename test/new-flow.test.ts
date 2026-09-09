@@ -211,6 +211,10 @@ function orderedTurn(quote = "ORDERED-TOOL-QUOTE", path = "ordered.md"): Json {
   };
 }
 
+function evaluation(feedback: Json): Json {
+  return { sentiment: feedback.sentiment, reason: feedback.reason };
+}
+
 function extraction(quote: string, options: { name?: string | null; certain?: boolean; summary?: string } = {}): Json {
   return {
     group: {
@@ -246,11 +250,47 @@ function addCliEvidence(
   });
   ok(root, ["feedback-extracted", "--stdin"], {
     feedback_id: created.feedback.id,
+    expected_evaluation: evaluation(created.feedback),
     extraction: extraction(shared, { name: groupName, certain: true, summary: `evidence ${index}` }),
     model: { provider: "fake", id: "fake", thinking: "high" },
   });
-  ok(root, ["feedback-complete", "--stdin"], { feedback_id: created.feedback.id, group: groupName });
+  ok(root, ["feedback-complete", "--stdin"], {
+    feedback_id: created.feedback.id,
+    expected_evaluation: evaluation(created.feedback),
+    group: groupName,
+  });
   return created.feedback;
+}
+
+function addProposal(root: string, group: string, proposedRules: string[]): Json {
+  const prepared = ok(root, ["prepare-evolution", "--stdin"], { group });
+  assert.equal(prepared.trigger, true);
+  return ok(root, ["save-evolution", "--stdin"], {
+    group_id: prepared.group.id,
+    base_digest: prepared.base_digest,
+    evidence_digest: prepared.evidence_digest,
+    evidence_ids: prepared.evidence.map((item: Json) => item.id),
+    proposed_rules: proposedRules,
+    rationale: `proposal for ${group}`,
+  }).proposal;
+}
+
+function writeDelayedPreferenceCli(root: string, command: string): { script: string; started: string } {
+  const script = join(root, `delay-${command}.py`);
+  const started = join(root, `${command}.started`);
+  writeFileSync(script, [
+    "import os, signal, sys, time",
+    `target = ${JSON.stringify(command)}`,
+    `started = ${JSON.stringify(started)}`,
+    `real = ${JSON.stringify(cliPath)}`,
+    "if len(sys.argv) > 1 and sys.argv[1] == target:",
+    "    open(started, 'w', encoding='utf-8').write('started')",
+    "    def stop(*_args): raise SystemExit(143)",
+    "    signal.signal(signal.SIGTERM, stop)",
+    "    while True: time.sleep(0.01)",
+    "os.execv(sys.executable, [sys.executable, real, *sys.argv[1:]])",
+  ].join("\n"));
+  return { script, started };
 }
 
 interface HarnessOptions {
@@ -265,6 +305,7 @@ interface HarnessOptions {
   detailInputs?: string[][];
   selectReply?: (title: string, choices: string[]) => string | undefined;
   inputReplies?: Array<string | undefined>;
+  editorReply?: (title: string, prefill: string | undefined) => string | undefined | Promise<string | undefined>;
   terminalRows?: number;
   terminalColumns?: number;
   preferenceCli?: string;
@@ -290,6 +331,7 @@ function harness(t: test.TestContext, options: HarnessOptions = {}) {
   const prompts: string[] = [];
   const modelRequests: Json[] = [];
   const selects: Array<{ title: string; choices: string[] }> = [];
+  const editors: Array<{ title: string; prefill: string | undefined }> = [];
   const statuses: Array<string | undefined> = [];
   const renderedViews: string[][] = [];
   const customComponents: any[] = [];
@@ -343,7 +385,10 @@ function harness(t: test.TestContext, options: HarnessOptions = {}) {
       return options.selectReply?.(title, choices);
     },
     async input() { return inputReplies.shift(); },
-    async editor() { return inputReplies.shift(); },
+    async editor(title: string, prefill?: string) {
+      editors.push({ title, prefill });
+      return options.editorReply ? options.editorReply(title, prefill) : inputReplies.shift();
+    },
     async confirm() { throw new Error("confirm is not part of the new flow"); },
     custom(factory: Function) {
       events.push("custom");
@@ -364,7 +409,7 @@ function harness(t: test.TestContext, options: HarnessOptions = {}) {
           const isPicker = initial.some((line: string) => line.includes("选择最近对话"));
           const isEvidencePicker = initial.some((line: string) => line.includes("选择演化证据"));
           const isLoader = component?.constructor?.name === "BorderedLoader";
-          const isMenu = initial.some((line: string) => line.includes("Right/Enter 进入") || line.includes("→ 进入"));
+          const isMenu = initial.some((line: string) => line.includes("Right/Enter 进入") || line.includes("→ 进入") || line.includes("Space 编辑"));
           if (isMenu) {
             const rendered = initial.join("\n");
             const menuTitle = String(initial[1] ?? "").trim();
@@ -455,6 +500,7 @@ function harness(t: test.TestContext, options: HarnessOptions = {}) {
     prompts,
     modelRequests,
     selects,
+    editors,
     statuses,
     renderedViews,
     get sentMessages() { return sentMessages; },
@@ -503,6 +549,531 @@ function harness(t: test.TestContext, options: HarnessOptions = {}) {
   resourcesFor(t).shutdowns.push(() => fixture.shutdown());
   return fixture;
 }
+
+test("E01 feedback list Space edits type and full reason while select and RPC remain read-only", async (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  const created = addCliEvidence(root, 1);
+  const flow = harness(t, {
+    root,
+    editorReply: () => "新 理由\n第二行 中文",
+    menuInputs: [
+      { title: "反馈与证据", keys: [" "] },
+      { title: "编辑评价类型（暂存）", keys: ["\x1b[B", "\x1b[C"] },
+      { title: "反馈与证据", keys: ["\x1b[D"] },
+    ],
+  });
+  await flow.menu("反馈与证据");
+  const stored = ok(root, ["feedback-get", "--stdin"], { feedback_id: created.id }).feedback;
+  assert.equal(stored.sentiment, "good");
+  assert.equal(stored.reason, "新 理由\n第二行 中文");
+  assert.equal(flow.modelCalls, 0);
+  assert.deepEqual(flow.editors, [{
+    title: "编辑评价理由 · 提交即覆盖保存 good 类型与完整理由",
+    prefill: "original reason 1",
+  }]);
+  assert.ok(flow.renderedViews.some((view) => view.some((line) => line.includes("Space 编辑"))));
+  assert.ok(flow.renderedViews.some((view) => view.some((line) => line.includes("→") && line.includes("新 理由 第二行 中文"))));
+  assert.ok(flow.notices.some((item) => item.message.includes("评价已更新") && item.message.includes("已有证据未自动更新")));
+
+  for (const columns of [24, 30, 40, 80]) {
+    let component: any;
+    const selection = new MenuSession({
+      mode: "tui",
+      ui: { custom(factory: Function) {
+        return new Promise((resolvePromise) => {
+          component = factory({ requestRender() {}, terminal: { rows: 24, columns } }, themeForTest(), {}, resolvePromise);
+        });
+      } },
+    } as any).selectAction("narrow-feedback", "反馈与证据", Array.from({ length: 30 }, (_, index) => ({
+      value: `feedback-${index}`,
+      label: `r${index} ${"长中文".repeat(20)}`,
+    })));
+    const initial = component.render(columns);
+    assert.ok(initial.some((line: string) => line.includes("Space")));
+    assert.ok(initial.length <= 24);
+    assert.ok(initial.every((line: string) => visibleWidth(line) <= columns));
+    for (let index = 0; index < 29; index += 1) component.handleInput("\x1b[B");
+    const finalView = component.render(columns);
+    assert.ok(finalView.length <= 24);
+    assert.ok(finalView.every((line: string) => visibleWidth(line) <= columns));
+    assert.ok(finalView.some((line: string) => line.includes("→") && line.includes("r29")));
+    component.handleInput(" ");
+    assert.deepEqual(await selection, { value: "feedback-29", action: "space" });
+  }
+
+  const viewOnly = harness(t, {
+    root,
+    menuInputs: [
+      { title: "反馈与证据", keys: ["\x1b[C"] },
+      { title: "反馈与证据", keys: ["\x1b[D"] },
+    ],
+  });
+  await viewOnly.menu("反馈与证据");
+  assert.equal(viewOnly.editors.length, 0);
+
+  let rpcSelections = 0;
+  const rpc = harness(t, {
+    root,
+    mode: "rpc",
+    selectReply: (title, choices) => {
+      if (title === "反馈与证据" && rpcSelections++ === 0) return choices[0];
+      return undefined;
+    },
+  });
+  await rpc.menu("反馈与证据");
+  assert.equal(rpc.editors.length, 0);
+  assert.equal(ok(root, ["feedback-get", "--stdin"], { feedback_id: created.id }).feedback.reason, "新 理由\n第二行 中文");
+});
+
+test("E02 cancellation, invalid and unchanged edits are inert while all feedback labels stay single-line", async (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  const created = ok(root, ["feedback-create", "--stdin"], {
+    sentiment: "fix",
+    reason: "第一行\n第二行\t中文",
+    selected_turns: [{ user: "u", assistant: "a" }],
+    model: null,
+    group: null,
+  }).feedback;
+  const before = readFileSync(join(root, "local/learning.json"), "utf8");
+  const same = ok(root, ["feedback-edit-evaluation", "--stdin"], {
+    feedback_id: created.id,
+    expected_evaluation: evaluation(created),
+    sentiment: "fix",
+    reason: "第一行\n第二行\t中文",
+  });
+  assert.equal(same.changed, false);
+  assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), before);
+  for (const reason of [" \n\t ", "x".repeat(4001)]) {
+    const rejected = cli(root, ["feedback-edit-evaluation", "--stdin"], {
+      feedback_id: created.id,
+      expected_evaluation: evaluation(created),
+      sentiment: "good",
+      reason,
+    });
+    assert.equal(rejected.ok, false);
+    assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), before);
+  }
+
+  const cancelled = harness(t, {
+    root,
+    editorReply: () => undefined,
+    menuInputs: [
+      { title: "反馈与证据", keys: [" "] },
+      { title: "编辑评价类型（暂存）", keys: ["\x1b[C"] },
+      { title: "反馈与证据", keys: ["\x1b[D"] },
+    ],
+  });
+  await cancelled.menu("反馈与证据");
+  assert.equal(cancelled.modelCalls, 0);
+  assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), before);
+
+  for (const choice of ["反馈与证据", "重新整理反馈", "处理待办"]) {
+    const labels = harness(t, {
+      root,
+      terminalColumns: 160,
+      menuInputs: [{ title: choice, keys: ["\x1b[D"] }],
+    });
+    await labels.menu(choice);
+    assert.ok(labels.renderedViews.flat().every((line) => !/[\r\n]/u.test(line)));
+    assert.ok(labels.renderedViews.flat().some((line) => line.includes("第一行 第二行 中文")));
+  }
+  assert.equal(ok(root, ["feedback-get", "--stdin"], { feedback_id: created.id }).feedback.reason, "第一行\n第二行\t中文");
+
+  const focusRoot = temporaryRoot(t);
+  ok(focusRoot, ["init"]);
+  ok(focusRoot, ["feedback-create", "--stdin"], {
+    sentiment: "fix", reason: "first row", selected_turns: [{ user: "u1", assistant: "a1" }], model: null, group: null,
+  });
+  const focusTarget = ok(focusRoot, ["feedback-create", "--stdin"], {
+    sentiment: "fix", reason: "target old", selected_turns: [{ user: "u2", assistant: "a2" }], model: null, group: null,
+  }).feedback;
+  ok(focusRoot, ["feedback-create", "--stdin"], {
+    sentiment: "good", reason: "last row", selected_turns: [{ user: "u3", assistant: "a3" }], model: null, group: null,
+  });
+  const focused = harness(t, {
+    root: focusRoot,
+    terminalColumns: 160,
+    editorReply: () => "目标新理由\n第二行",
+    menuInputs: [
+      { title: "反馈与证据", keys: ["\x1b[B", " "] },
+      { title: "编辑评价类型（暂存）", keys: ["\x1b[B", "\x1b[C"] },
+      { title: "反馈与证据", keys: ["\x1b[D"] },
+    ],
+  });
+  await focused.menu("反馈与证据");
+  const focusedSaved = ok(focusRoot, ["feedback-get", "--stdin"], { feedback_id: focusTarget.id }).feedback;
+  assert.equal(focusedSaved.sentiment, "good");
+  assert.equal(focusedSaved.reason, "目标新理由\n第二行");
+  const focusedLine = focused.renderedViews.flat().find((line) =>
+    line.includes("→") && line.includes(focusTarget.id.slice(-8)) && line.includes("目标新理由 第二行"));
+  assert.ok(focusedLine);
+  assert.match(focusedLine, /2\. good ·/);
+  const narrowLabels = harness(t, {
+    root: focusRoot,
+    terminalColumns: 30,
+    menuInputs: [{ title: "反馈与证据", keys: ["\x1b[D"] }],
+  });
+  await narrowLabels.menu("反馈与证据");
+  assert.ok(narrowLabels.renderedViews.flat().some((line) => /[123]\. good ·/u.test(line)));
+  assert.ok(narrowLabels.renderedViews.flat().some((line) => /[123]\. fix ·/u.test(line)));
+
+  const redacted = ok(root, ["feedback-edit-evaluation", "--stdin"], {
+    feedback_id: created.id,
+    expected_evaluation: evaluation(created),
+    sentiment: "good",
+    reason: "token sk_abcdefghijklmnop should be hidden",
+  });
+  assert.equal(redacted.feedback.reason, "token [REDACTED_CREDENTIAL] should be hidden");
+});
+
+test("E03 evaluation save preserves evidence and unrelated state, clears obsolete extraction, and stales only related proposals", (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  ok(root, ["manage-group", "--stdin"], { action: "create", name: "coding", description: "coding" });
+  const globalFeedback = [1, 2, 3].map((index) => addCliEvidence(root, index));
+  [4, 5, 6].forEach((index) => addCliEvidence(root, index, "assistant", "coding"));
+  const related = addProposal(root, "global", ["global proposal"]);
+  const unrelated = addProposal(root, "coding", ["coding proposal"]);
+  const beforeLearning = learning(root);
+  const beforeGroups = readFileSync(join(root, "repo/groups.json"), "utf8");
+  const beforeHead = spawnSync("git", ["-C", join(root, "repo"), "rev-parse", "HEAD"], { encoding: "utf8" }).stdout;
+  const original = beforeLearning.feedback.find((item: Json) => item.id === globalFeedback[0]!.id);
+  const originalEvidence = beforeLearning.evidence.find((item: Json) => item.id === original.evidence_id);
+  const edited = ok(root, ["feedback-edit-evaluation", "--stdin"], {
+    feedback_id: original.id,
+    expected_evaluation: evaluation(original),
+    sentiment: "good",
+    reason: "updated organized evaluation",
+  });
+  assert.equal(edited.changed, true);
+  assert.equal(edited.invalidated_proposal_count, 1);
+  const after = learning(root);
+  const saved = after.feedback.find((item: Json) => item.id === original.id);
+  assert.deepEqual(after.evidence.find((item: Json) => item.id === originalEvidence.id), originalEvidence);
+  for (const key of ["id", "created_at", "selected_turns", "model", "group_name", "status", "evidence_id", "error", "extraction"]) {
+    assert.deepEqual(saved[key], original[key]);
+  }
+  assert.equal(after.proposals.find((item: Json) => item.id === related.id).status, "stale");
+  assert.equal(after.proposals.find((item: Json) => item.id === unrelated.id).status, "pending");
+  assert.deepEqual(after.reviewed_evidence, beforeLearning.reviewed_evidence);
+  assert.equal(readFileSync(join(root, "repo/groups.json"), "utf8"), beforeGroups);
+  assert.equal(spawnSync("git", ["-C", join(root, "repo"), "rev-parse", "HEAD"], { encoding: "utf8" }).stdout, beforeHead);
+
+  const pending = ok(root, ["feedback-create", "--stdin"], {
+    sentiment: "fix", reason: "old pending reason", selected_turns: [{ user: "pending", assistant: "pending answer" }],
+    model: null, group: null,
+  }).feedback;
+  ok(root, ["feedback-extracted", "--stdin"], {
+    feedback_id: pending.id,
+    expected_evaluation: evaluation(pending),
+    extraction: extraction("pending answer", { name: null, certain: false }),
+    model: { provider: "fake", id: "old", thinking: "low" },
+  });
+  const pendingBefore = ok(root, ["feedback-get", "--stdin"], { feedback_id: pending.id }).feedback;
+  const reset = ok(root, ["feedback-edit-evaluation", "--stdin"], {
+    feedback_id: pending.id,
+    expected_evaluation: evaluation(pendingBefore),
+    sentiment: "good",
+    reason: "new pending reason",
+  }).feedback;
+  assert.equal(reset.status, "saved");
+  assert.equal(reset.extraction, null);
+  assert.equal(reset.error, null);
+  assert.deepEqual(reset.selected_turns, pending.selected_turns);
+  assert.equal(learning(root).evidence.some((item: Json) => item.feedback_id === pending.id), false);
+});
+
+test("E04 optimistic evaluation edits allow unrelated progress and roll back atomically on write failure", (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  const first = ok(root, ["feedback-create", "--stdin"], {
+    sentiment: "fix", reason: "shared old", selected_turns: [{ user: "u1", assistant: "a1" }], model: null, group: null,
+  }).feedback;
+  const expected = evaluation(first);
+  ok(root, ["feedback-edit-evaluation", "--stdin"], {
+    feedback_id: first.id, expected_evaluation: expected, sentiment: "good", reason: "first writer",
+  });
+  const stale = ok(root, ["feedback-edit-evaluation", "--stdin"], {
+    feedback_id: first.id, expected_evaluation: expected, sentiment: "fix", reason: "second writer",
+  });
+  assert.equal(stale.stale, true);
+  assert.equal(stale.feedback.reason, "first writer");
+
+  const progressed = ok(root, ["feedback-create", "--stdin"], {
+    sentiment: "fix", reason: "progressed", selected_turns: [{ user: "u2", assistant: "a2" }], model: null, group: null,
+  }).feedback;
+  ok(root, ["feedback-fail", "--stdin"], {
+    feedback_id: progressed.id, expected_evaluation: evaluation(progressed), error: "background status",
+  });
+  ok(root, ["feedback-create", "--stdin"], {
+    sentiment: "good", reason: "unrelated", selected_turns: [{ user: "u3", assistant: "a3" }], model: null, group: null,
+  });
+  const allowed = ok(root, ["feedback-edit-evaluation", "--stdin"], {
+    feedback_id: progressed.id, expected_evaluation: evaluation(progressed), sentiment: "good", reason: "allowed after progress",
+  });
+  assert.equal(allowed.changed, true);
+
+  const proposalRoot = temporaryRoot(t);
+  ok(proposalRoot, ["init"]);
+  const candidateFeedback = [1, 2, 3].map((index) => addCliEvidence(proposalRoot, index));
+  addProposal(proposalRoot, "global", ["must remain pending"]);
+  const target = ok(proposalRoot, ["feedback-get", "--stdin"], { feedback_id: candidateFeedback[0]!.id }).feedback;
+  const payload = {
+    feedback_id: target.id,
+    expected_evaluation: evaluation(target),
+    sentiment: target.sentiment === "good" ? "fix" : "good",
+    reason: "must fail atomically",
+  };
+  const beforeFailure = readFileSync(join(proposalRoot, "local/learning.json"), "utf8");
+  const script = [
+    "from pathlib import Path",
+    "import json, sys",
+    `sys.path.insert(0, ${JSON.stringify(pythonRoot)})`,
+    "import wikiskill_preference as cli",
+    "from wikiskill_preference_core.storage import PreferenceStore",
+    `store = PreferenceStore(Path(${JSON.stringify(proposalRoot)}))`,
+    `payload = json.loads(${JSON.stringify(JSON.stringify(payload))})`,
+    "store.write_learning = lambda _value: (_ for _ in ()).throw(OSError('write failed'))",
+    "try:",
+    "    cli._feedback_edit_evaluation(store, payload)",
+    "except OSError:",
+    "    pass",
+  ].join("\n");
+  const failed = spawnSync("python3", ["-c", script], { encoding: "utf8", timeout: 10_000 });
+  assert.equal(failed.status, 0, failed.stderr);
+  assert.equal(readFileSync(join(proposalRoot, "local/learning.json"), "utf8"), beforeFailure);
+});
+
+test("E05 required evaluation snapshots reject every old success and failure callback without pollution", async (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  const initial = ok(root, ["feedback-create", "--stdin"], {
+    sentiment: "fix", reason: "initial", selected_turns: [{ user: "old user", assistant: "old answer" }], model: null, group: "global",
+  }).feedback;
+  for (const [command, extra] of [
+    ["feedback-extracted", { extraction: extraction("old answer"), model: { provider: "fake", id: "fake", thinking: "high" } }],
+    ["feedback-complete", { group: "global" }],
+    ["feedback-fail", { error: "old error" }],
+  ] as const) {
+    const missing = cli(root, [command, "--stdin"], { feedback_id: initial.id, ...extra });
+    assert.equal(missing.ok, false);
+    assert.match(missing.error.message, /expected_evaluation/);
+    const invalid = cli(root, [command, "--stdin"], {
+      feedback_id: initial.id,
+      expected_evaluation: { sentiment: "maybe", reason: "initial" },
+      ...extra,
+    });
+    assert.equal(invalid.ok, false);
+  }
+
+  const oldEvaluation = evaluation(initial);
+  ok(root, ["feedback-edit-evaluation", "--stdin"], {
+    feedback_id: initial.id, expected_evaluation: oldEvaluation, sentiment: "good", reason: "edited",
+  });
+  const afterEdit = readFileSync(join(root, "local/learning.json"), "utf8");
+  for (const [command, extra] of [
+    ["feedback-extracted", { extraction: extraction("old answer"), model: { provider: "fake", id: "old", thinking: "high" } }],
+    ["feedback-fail", { error: "old failure" }],
+  ] as const) {
+    const stale = ok(root, [command, "--stdin"], { feedback_id: initial.id, expected_evaluation: oldEvaluation, ...extra });
+    assert.equal(stale.stale, true);
+    assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), afterEdit);
+  }
+
+  const grouping = ok(root, ["feedback-create", "--stdin"], {
+    sentiment: "fix", reason: "before group", selected_turns: [{ user: "group user", assistant: "group answer" }], model: null, group: "global",
+  }).feedback;
+  ok(root, ["feedback-extracted", "--stdin"], {
+    feedback_id: grouping.id, expected_evaluation: evaluation(grouping), extraction: extraction("group answer"),
+    model: { provider: "fake", id: "old", thinking: "high" },
+  });
+  const groupingStored = ok(root, ["feedback-get", "--stdin"], { feedback_id: grouping.id }).feedback;
+  ok(root, ["feedback-edit-evaluation", "--stdin"], {
+    feedback_id: grouping.id, expected_evaluation: evaluation(groupingStored), sentiment: "good", reason: "changed before grouping",
+  });
+  const afterGroupingEdit = readFileSync(join(root, "local/learning.json"), "utf8");
+  const staleComplete = ok(root, ["feedback-complete", "--stdin"], {
+    feedback_id: grouping.id, expected_evaluation: evaluation(grouping), group: "global",
+  });
+  assert.equal(staleComplete.stale, true);
+  assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), afterGroupingEdit);
+
+  const replaced = ok(root, ["feedback-create", "--stdin"], {
+    sentiment: "fix", reason: "old complete", selected_turns: [{ user: "new user", assistant: "new answer" }], model: null, group: "global",
+  }).feedback;
+  const replacedOld = evaluation(replaced);
+  const edited = ok(root, ["feedback-edit-evaluation", "--stdin"], {
+    feedback_id: replaced.id, expected_evaluation: replacedOld, sentiment: "good", reason: "new complete",
+  }).feedback;
+  ok(root, ["feedback-extracted", "--stdin"], {
+    feedback_id: replaced.id, expected_evaluation: evaluation(edited), extraction: extraction("new answer"),
+    model: { provider: "fake", id: "new", thinking: "high" },
+  });
+  ok(root, ["feedback-complete", "--stdin"], {
+    feedback_id: replaced.id, expected_evaluation: evaluation(edited), group: "global",
+  });
+  const completedBytes = readFileSync(join(root, "local/learning.json"), "utf8");
+  assert.equal(ok(root, ["feedback-extracted", "--stdin"], {
+    feedback_id: replaced.id, expected_evaluation: replacedOld, extraction: extraction("new answer"),
+    model: { provider: "fake", id: "old", thinking: "high" },
+  }).stale, true);
+  assert.equal(ok(root, ["feedback-fail", "--stdin"], {
+    feedback_id: replaced.id, expected_evaluation: replacedOld, error: "late old failure",
+  }).stale, true);
+  assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), completedBytes);
+
+  const gate = deferred<ModelReply>();
+  const flow = harness(t, { root: temporaryRoot(t), modelReply: () => gate.promise });
+  await flow.pref("feedback --group global fix handler-initial");
+  await waitFor(() => flow.modelCalls === 1, "feedback handler model start");
+  const handlerFeedback = learning(flow.root).feedback[0];
+  ok(flow.root, ["feedback-edit-evaluation", "--stdin"], {
+    feedback_id: handlerFeedback.id,
+    expected_evaluation: evaluation(handlerFeedback),
+    sentiment: "good",
+    reason: "handler-new",
+  });
+  const statusCount = flow.statuses.length;
+  gate.resolve(extraction("selected-assistant-0"));
+  await waitFor(() => flow.statuses.slice(statusCount).some((status) =>
+    typeof status === "string" && !status.includes("后台处理中") && !status.includes("状态异常")), "stale handler task completion");
+  const handlerStored = learning(flow.root);
+  assert.equal(handlerStored.feedback[0].reason, "handler-new");
+  assert.equal(handlerStored.feedback[0].status, "saved");
+  assert.equal(handlerStored.evidence.length, 0);
+  assert.doesNotMatch(flow.notices.map((item) => item.message).join("\n"), /已整理|整理失败/);
+});
+
+test("E06 edits feed future reprocessing and invalidate old reprocess and evolution snapshots without model calls", async (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  const feedback = [1, 2, 3].map((index) => addCliEvidence(root, index));
+  const target = ok(root, ["feedback-get", "--stdin"], { feedback_id: feedback[2]!.id }).feedback;
+  const reprocess = ok(root, ["feedback-reprocess", "--stdin"], { action: "prepare", feedback_id: target.id });
+  const automatic = ok(root, ["prepare-evolution", "--stdin"], { group: "global" });
+  const manual = ok(root, ["manual-evolution", "--stdin"], {
+    action: "prepare", group_id: automatic.group.id, evidence_ids: [target.evidence_id],
+  });
+  const edited = ok(root, ["feedback-edit-evaluation", "--stdin"], {
+    feedback_id: target.id,
+    expected_evaluation: evaluation(target),
+    sentiment: target.sentiment === "good" ? "fix" : "good",
+    reason: "new evaluation used by reprocess",
+  });
+  assert.equal(edited.changed, true);
+  assert.equal(cli(root, ["feedback-reprocess", "--stdin"], {
+    action: "apply", feedback_id: target.id, group_id: reprocess.group.id,
+    expected_digest: reprocess.expected_digest, expected_group_digest: reprocess.group.base_digest,
+    extraction: reprocess.feedback.extraction, model: { provider: "fake", id: "fake", thinking: "high" },
+  }).ok, false);
+  assert.equal(cli(root, ["save-evolution", "--stdin"], {
+    group_id: automatic.group.id, base_digest: automatic.base_digest, evidence_digest: automatic.evidence_digest,
+    evidence_ids: automatic.evidence.map((item: Json) => item.id), proposed_rules: ["old automatic"], rationale: "old",
+  }).ok, false);
+  assert.equal(cli(root, ["manual-evolution", "--stdin"], {
+    action: "apply", group_id: manual.group.id, evidence_ids: manual.evidence_ids,
+    base_digest: manual.base_digest, evidence_digest: manual.evidence_digest,
+    proposed_rules: ["old manual"], rationale: "old",
+  }).ok, false);
+
+  const flow = harness(t, {
+    root,
+    detailInputs: [["\x1b"]],
+    modelReply: () => extraction("quote-1", { summary: "fresh" }),
+  });
+  await flow.menu("重新整理反馈");
+  assert.equal(flow.modelCalls, 1);
+  const promptInput = JSON.parse(flow.prompts[0]!.split("\n\n").at(-1)!);
+  assert.deepEqual(promptInput.evaluation, {
+    sentiment: edited.feedback.sentiment,
+    reason: "new evaluation used by reprocess",
+  });
+
+  const candidate = addProposal(root, "global", ["opened stale candidate"]);
+  const candidateTarget = ok(root, ["feedback-get", "--stdin"], { feedback_id: feedback[1]!.id }).feedback;
+  const beforeRules = readFileSync(join(root, "repo/groups.json"), "utf8");
+  const candidateEdit = ok(root, ["feedback-edit-evaluation", "--stdin"], {
+    feedback_id: candidateTarget.id,
+    expected_evaluation: evaluation(candidateTarget),
+    sentiment: candidateTarget.sentiment === "good" ? "fix" : "good",
+    reason: "invalidate open candidate",
+  });
+  assert.equal(candidateEdit.invalidated_proposal_count, 1);
+  const resolved = ok(root, ["resolve-evolution", "--stdin"], { proposal_id: candidate.id, decision: "apply" });
+  assert.equal(resolved.proposal.status, "stale");
+  assert.equal(readFileSync(join(root, "repo/groups.json"), "utf8"), beforeRules);
+  assert.equal(flow.modelCalls, 1);
+});
+
+test("E07 feedback list, get, type selection, and delayed native editor stop after shutdown without late save or UI", async (t) => {
+  for (const command of ["feedback-list", "feedback-get"]) {
+    const root = temporaryRoot(t);
+    ok(root, ["init"]);
+    addCliEvidence(root, 1);
+    const delayed = writeDelayedPreferenceCli(root, command);
+    const flow = harness(t, {
+      root,
+      preferenceCli: delayed.script,
+      menuInputs: command === "feedback-get" ? [{ title: "反馈与证据", keys: ["\x1b[C"] }] : [],
+    });
+    const before = readFileSync(join(root, "local/learning.json"), "utf8");
+    const running = flow.menu("反馈与证据");
+    await waitFor(() => existsSync(delayed.started), `${command} start`);
+    const views = flow.renderedViews.length;
+    const notices = flow.notices.length;
+    await flow.shutdown("reload");
+    await running;
+    assert.equal(flow.renderedViews.length, views);
+    assert.equal(flow.notices.length, notices);
+    assert.equal(flow.editors.length, 0);
+    assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), before);
+  }
+
+  const typeRoot = temporaryRoot(t);
+  ok(typeRoot, ["init"]);
+  addCliEvidence(typeRoot, 1);
+  const typeFlow = harness(t, {
+    root: typeRoot,
+    menuInputs: [
+      { title: "反馈与证据", keys: [" "] },
+      { title: "编辑评价类型（暂存）", keys: [] },
+    ],
+  });
+  const typeBefore = readFileSync(join(typeRoot, "local/learning.json"), "utf8");
+  const choosingType = typeFlow.menu("反馈与证据");
+  await waitFor(() => typeFlow.renderedViews.flat().some((line) => line.includes("编辑评价类型")), "evaluation type selection");
+  await typeFlow.shutdown("reload");
+  await choosingType;
+  assert.equal(typeFlow.editors.length, 0);
+  assert.equal(readFileSync(join(typeRoot, "local/learning.json"), "utf8"), typeBefore);
+
+  const editorRoot = temporaryRoot(t);
+  ok(editorRoot, ["init"]);
+  addCliEvidence(editorRoot, 1);
+  const editorGate = deferred<string | undefined>();
+  const editorFlow = harness(t, {
+    root: editorRoot,
+    editorReply: () => editorGate.promise,
+    menuInputs: [
+      { title: "反馈与证据", keys: [" "] },
+      { title: "编辑评价类型（暂存）", keys: ["\x1b[C"] },
+    ],
+  });
+  const editorBefore = readFileSync(join(editorRoot, "local/learning.json"), "utf8");
+  const editing = editorFlow.menu("反馈与证据");
+  await waitFor(() => editorFlow.editors.length === 1, "native editor start");
+  const views = editorFlow.renderedViews.length;
+  const notices = editorFlow.notices.length;
+  await editorFlow.shutdown("reload");
+  assert.equal(editorFlow.editors.length, 1);
+  editorGate.resolve("must not save after shutdown");
+  await editing;
+  assert.equal(editorFlow.renderedViews.length, views);
+  assert.equal(editorFlow.notices.length, notices);
+  assert.equal(readFileSync(join(editorRoot, "local/learning.json"), "utf8"), editorBefore);
+});
 
 test("command parser and branch picker keep the bounded real-conversation contract", async () => {
   assert.throws(() => parsePrefCommand("feedback good"), /requires a reason/);
@@ -1325,6 +1896,7 @@ test("CLI persists the first extraction across processes and keeps old records r
   const feedbackId = created.feedback.id;
   const saved = ok(root, ["feedback-extracted", "--stdin"], {
     feedback_id: feedbackId,
+    expected_evaluation: evaluation(created.feedback),
     extraction: extraction("shared quote", { name: "global", certain: true, summary: "first summary" }),
     model: { provider: "actual", id: "used-model", thinking: "high" },
   });
@@ -1336,14 +1908,19 @@ test("CLI persists the first extraction across processes and keeps old records r
 
   const duplicate = ok(root, ["feedback-extracted", "--stdin"], {
     feedback_id: feedbackId,
+    expected_evaluation: evaluation(created.feedback),
     extraction: extraction("shared quote", { name: null, certain: false, summary: "must not replace" }),
     model: { provider: "later", id: "other-model", thinking: "off" },
   });
   assert.equal(duplicate.feedback.extraction.evidence.summary, "first summary");
   assert.equal(duplicate.feedback.model.id, "used-model");
-  const completed = ok(root, ["feedback-complete", "--stdin"], { feedback_id: feedbackId, group: "global" });
+  const completed = ok(root, ["feedback-complete", "--stdin"], {
+    feedback_id: feedbackId, expected_evaluation: evaluation(created.feedback), group: "global",
+  });
   assert.equal(completed.evidence.summary, "first summary");
-  ok(root, ["feedback-fail", "--stdin"], { feedback_id: feedbackId, error: "late failure" });
+  ok(root, ["feedback-fail", "--stdin"], {
+    feedback_id: feedbackId, expected_evaluation: evaluation(created.feedback), error: "late failure",
+  });
   assert.equal(ok(root, ["feedback-get", "--stdin"], { feedback_id: feedbackId }).feedback.status, "organized");
 
   const oldLearning = learning(root);
@@ -1358,6 +1935,7 @@ test("CLI persists the first extraction across processes and keeps old records r
   });
   const rejected = cli(root, ["feedback-extracted", "--stdin"], {
     feedback_id: invalid.feedback.id,
+    expected_evaluation: evaluation(invalid.feedback),
     extraction: extraction("user\nonly assistant"),
     model: { provider: "fake", id: "fake", thinking: "off" },
   });
@@ -1556,6 +2134,7 @@ test("T07 event quotes use single-event sources and evolution omits raw timeline
   for (const quote of ["quoted-path.md", "change-1", "ordered userordered assistant before", "OLD-DISCARDED-RESULT"]) {
     const rejected = cli(root, ["feedback-extracted", "--stdin"], {
       feedback_id: invalid.feedback.id,
+      expected_evaluation: evaluation(invalid.feedback),
       extraction: extraction(quote, { name: null, certain: false }),
       model: { provider: "fake", id: "fake", thinking: "high" },
     });
@@ -1572,10 +2151,13 @@ test("T07 event quotes use single-event sources and evolution omits raw timeline
     });
     ok(root, ["feedback-extracted", "--stdin"], {
       feedback_id: created.feedback.id,
+      expected_evaluation: evaluation(created.feedback),
       extraction: extraction(quote, { summary: `event evidence ${index}` }),
       model: { provider: "fake", id: "fake", thinking: "high" },
     });
-    const completed = ok(root, ["feedback-complete", "--stdin"], { feedback_id: created.feedback.id, group: "global" });
+    const completed = ok(root, ["feedback-complete", "--stdin"], {
+      feedback_id: created.feedback.id, expected_evaluation: evaluation(created.feedback), group: "global",
+    });
     assert.equal(completed.duplicate, false);
     const detail = ok(root, ["feedback-get", "--stdin"], { feedback_id: created.feedback.id });
     assert.deepEqual(detail.quote_sources, [{ text: quote, role: "tool" }]);
@@ -1605,10 +2187,13 @@ test("C07 file changes do not alter evidence counts or leak wholesale into evolu
     });
     ok(root, ["feedback-extracted", "--stdin"], {
       feedback_id: created.feedback.id,
+      expected_evaluation: evaluation(created.feedback),
       extraction: extraction(`NECESSARY-TOOL-QUOTE-${index}`, { name: "global", certain: true, summary: `summary-${index}` }),
       model: { provider: "fake", id: "fake", thinking: "high" },
     });
-    ok(root, ["feedback-complete", "--stdin"], { feedback_id: created.feedback.id, group: "global" });
+    ok(root, ["feedback-complete", "--stdin"], {
+      feedback_id: created.feedback.id, expected_evaluation: evaluation(created.feedback), group: "global",
+    });
   }
   const stored = learning(root);
   assert.equal(stored.feedback.length, 3);
@@ -1879,6 +2464,7 @@ test("F01 expired explicit groups require a manual choice and keep the saved ext
   });
   ok(root, ["feedback-extracted", "--stdin"], {
     feedback_id: created.feedback.id,
+    expected_evaluation: evaluation(created.feedback),
     extraction: extraction("selected assistant", { name: "global", certain: true, summary: "saved before group removal" }),
     model: { provider: "old", id: "old", thinking: "high" },
   });
@@ -2124,6 +2710,7 @@ test("R02 default evidence detail hides raw feedback metadata and reaches the mo
   });
   ok(root, ["feedback-extracted", "--stdin"], {
     feedback_id: secondCreated.feedback.id,
+    expected_evaluation: evaluation(secondCreated.feedback),
     extraction: {
       group: { name: "global", certain: true, reason: "group" },
       evidence: {
@@ -2133,7 +2720,9 @@ test("R02 default evidence detail hides raw feedback metadata and reaches the mo
     },
     model: { provider: "fake", id: "fake", thinking: "high" },
   });
-  ok(root, ["feedback-complete", "--stdin"], { feedback_id: secondCreated.feedback.id, group: "global" });
+  ok(root, ["feedback-complete", "--stdin"], {
+    feedback_id: secondCreated.feedback.id, expected_evaluation: evaluation(secondCreated.feedback), group: "global",
+  });
   const document = learning(root);
   document.feedback[0].created_at = "2026-01-01T00:00:00+00:00";
   document.feedback[0].reason = "REASON-SENTINEL";
@@ -2170,10 +2759,13 @@ test("T06 reprocess reuses exact ordered events while legacy prompts keep order 
   });
   ok(root, ["feedback-extracted", "--stdin"], {
     feedback_id: created.feedback.id,
+    expected_evaluation: evaluation(created.feedback),
     extraction: extraction("REPROCESS-EVENT-QUOTE", { summary: "old ordered evidence" }),
     model: { provider: "fake", id: "old", thinking: "high" },
   });
-  ok(root, ["feedback-complete", "--stdin"], { feedback_id: created.feedback.id, group: "global" });
+  ok(root, ["feedback-complete", "--stdin"], {
+    feedback_id: created.feedback.id, expected_evaluation: evaluation(created.feedback), group: "global",
+  });
   writeFileSync(join(root, "event-saved.md"), "CURRENT-EVENT-DISK\n");
   const gate = deferred<ModelReply>();
   const flow = harness(t, {
@@ -2559,6 +3151,7 @@ test("B11 model and validation failures preserve feedback, saved extraction retr
   });
   ok(root, ["feedback-extracted", "--stdin"], {
     feedback_id: created.feedback.id,
+    expected_evaluation: evaluation(created.feedback),
     extraction: extraction("stored assistant", { name: null, certain: false }),
     model: { provider: "old", id: "old", thinking: "low" },
   });

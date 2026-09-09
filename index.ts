@@ -49,6 +49,11 @@ interface StoredProposal {
   rationale: string;
 }
 
+interface FeedbackEvaluation {
+  sentiment: "good" | "fix";
+  reason: string;
+}
+
 interface StoredFeedback {
   id: string;
   created_at: string;
@@ -351,6 +356,25 @@ function storedFeedback(value: unknown): StoredFeedback {
   };
 }
 
+class StaleFeedbackEvaluationError extends Error {}
+class PreferenceInteractionStoppedError extends Error {}
+
+function feedbackEvaluation(feedback: StoredFeedback): FeedbackEvaluation {
+  return { sentiment: feedback.sentiment, reason: feedback.reason };
+}
+
+function requireCurrentEvaluation(result: Record<string, unknown>): void {
+  if (result.stale === true) throw new StaleFeedbackEvaluationError("反馈评价已变化");
+}
+
+function requireLive(services: BoundServices, signal: AbortSignal): void {
+  if (!services.isLive() || signal.aborted) throw new PreferenceInteractionStoppedError("偏好交互已停止");
+}
+
+function singleLineSummary(value: string, maximum: number): string {
+  return value.replace(/\s+/gu, " ").trim().slice(0, maximum);
+}
+
 function taskActive(signal: AbortSignal, services: BoundServices): boolean {
   return !signal.aborted && services.isLive();
 }
@@ -618,6 +642,7 @@ export function preferenceExtension(pi: ExtensionAPI): void {
   async function completeStoredExtraction(
     ctx: ExtensionCommandContext | ExtensionContext,
     feedback: StoredFeedback,
+    expectedEvaluation: FeedbackEvaluation,
     services: BoundServices,
     signal?: AbortSignal,
     interactive = false,
@@ -635,7 +660,12 @@ export function preferenceExtension(pi: ExtensionAPI): void {
       groupName = await selectOrCreateGroup(ctx as ExtensionCommandContext, groups, services) ?? null;
       if (!groupName) return null;
     }
-    const completed = await services.invoke(["feedback-complete", "--stdin"], { feedback_id: feedback.id, group: groupName }, 120_000, signal);
+    const completed = await services.invoke(["feedback-complete", "--stdin"], {
+      feedback_id: feedback.id,
+      expected_evaluation: expectedEvaluation,
+      group: groupName,
+    }, 120_000, signal);
+    requireCurrentEvaluation(completed);
     const evidence = completed.evidence as Record<string, unknown> | undefined;
     if (services.isLive()) {
       notify(ctx, `反馈已整理到 ${groupName}：${String(evidence?.summary ?? feedback.extraction.evidence.summary)}。详情：打开 /pref → 反馈与证据`, "info");
@@ -646,6 +676,7 @@ export function preferenceExtension(pi: ExtensionAPI): void {
 
   function startFeedbackTask(ctx: ExtensionContext, feedback: StoredFeedback, services: BoundServices): boolean {
     if (!services.model && !feedback.extraction) return false;
+    const expectedEvaluation = feedbackEvaluation(feedback);
     return tasks.start("feedback", feedback.id, async (signal) => {
       try {
         let saved = feedback;
@@ -660,30 +691,42 @@ export function preferenceExtension(pi: ExtensionAPI): void {
           const extracted = parseExtraction(output, saved.selected_turns);
           const stored = await services.invoke(["feedback-extracted", "--stdin"], {
             feedback_id: saved.id,
+            expected_evaluation: expectedEvaluation,
             extraction: extracted,
             model: services.model!.info,
           }, 120_000, signal);
           if (!taskActive(signal, services)) return;
+          requireCurrentEvaluation(stored);
           saved = storedFeedback(stored.feedback);
           if (stored.needs_group === true) {
             notify(ctx, "反馈整理结果已保存，待确定分组；请打开 /pref → 处理待办继续。", "warning");
             return;
           }
         }
-        const completedGroup = await completeStoredExtraction(ctx, saved, services, signal, false);
+        const completedGroup = await completeStoredExtraction(ctx, saved, expectedEvaluation, services, signal, false);
         if (completedGroup === null && taskActive(signal, services)) {
-          await services.invoke(["feedback-extracted", "--stdin"], {
+          const stored = await services.invoke(["feedback-extracted", "--stdin"], {
             feedback_id: saved.id,
+            expected_evaluation: expectedEvaluation,
             extraction: saved.extraction,
             model: saved.model ?? services.model!.info,
           }, 120_000, signal);
-          if (taskActive(signal, services)) notify(ctx, "反馈整理结果已保存，待确定分组；请打开 /pref → 处理待办继续。", "warning");
+          if (!taskActive(signal, services)) return;
+          requireCurrentEvaluation(stored);
+          notify(ctx, "反馈整理结果已保存，待确定分组；请打开 /pref → 处理待办继续。", "warning");
         }
       } catch (error) {
-        if (!taskActive(signal, services)) return;
+        if (!taskActive(signal, services) || error instanceof StaleFeedbackEvaluationError) return;
         try {
-          await services.invoke(["feedback-fail", "--stdin"], { feedback_id: feedback.id, error: taskError(error) }, 120_000, signal);
+          const failed = await services.invoke(["feedback-fail", "--stdin"], {
+            feedback_id: feedback.id,
+            expected_evaluation: expectedEvaluation,
+            error: taskError(error),
+          }, 120_000, signal);
+          if (!taskActive(signal, services)) return;
+          requireCurrentEvaluation(failed);
         } catch (writeError) {
+          if (writeError instanceof StaleFeedbackEvaluationError) return;
           if (taskActive(signal, services)) notify(ctx, `反馈整理失败且状态保存失败：${taskError(writeError)}`, "warning");
           return;
         }
@@ -743,7 +786,12 @@ export function preferenceExtension(pi: ExtensionAPI): void {
     }, 120_000);
     const feedback = storedFeedback(created.feedback);
     if (!services.model) {
-      await services.invoke(["feedback-fail", "--stdin"], { feedback_id: feedback.id, error: "当前 Pi 模型不可用" });
+      const failed = await services.invoke(["feedback-fail", "--stdin"], {
+        feedback_id: feedback.id,
+        expected_evaluation: feedbackEvaluation(feedback),
+        error: "当前 Pi 模型不可用",
+      });
+      requireCurrentEvaluation(failed);
       notify(ctx, "反馈与所选内容已保存；当前 Pi 模型不可用，请打开 /pref → 处理待办重试。", "warning");
       return true;
     }
@@ -765,7 +813,7 @@ export function preferenceExtension(pi: ExtensionAPI): void {
     }
     const items = rows.map((row, index) => ({
       value: row.id,
-      label: `${index + 1}. ${row.created_at} · ${row.group_name ?? "待分组"} · ${feedbackStatus(row.status)} · ${row.reason.slice(0, 60)} · ${row.id.slice(-8)}`,
+      label: `${index + 1}. ${row.created_at} · ${row.group_name ?? "待分组"} · ${feedbackStatus(row.status)} · ${singleLineSummary(row.reason, 60)} · ${row.id.slice(-8)}`,
     }));
     const selected = await menu.select("reprocess-feedback", "重新整理反馈", items);
     if (!services.isLive()) return true;
@@ -1023,21 +1071,80 @@ export function preferenceExtension(pi: ExtensionAPI): void {
   }
 
   async function feedbackDetails(ctx: ExtensionCommandContext, services: BoundServices, menu: MenuSession): Promise<void> {
-    for (;;) {
-      const result = await services.invoke(["feedback-list"]);
-      const rows = Array.isArray(result.feedback) ? result.feedback.map(storedFeedback) : [];
-      if (!rows.length) {
-        notify(ctx, "当前没有已保存反馈。", "info");
-        return;
+    const controller = new AbortController();
+    foregroundControllers.add(controller);
+    try {
+      for (;;) {
+        const result = await services.invoke(["feedback-list"], undefined, 60_000, controller.signal);
+        requireLive(services, controller.signal);
+        const rows = Array.isArray(result.feedback) ? result.feedback.map(storedFeedback) : [];
+        if (!rows.length) {
+          notify(ctx, "当前没有已保存反馈。", "info");
+          return;
+        }
+        const selection = await menu.selectAction("feedback-records", "反馈与证据", rows.map((row, index) => ({
+          value: row.id,
+          label: `${index + 1}. ${row.sentiment} · ${row.created_at} · ${row.group_name ?? "待分组"} · ${feedbackStatus(row.status)} · ${singleLineSummary(row.reason, 60)} · ${row.id.slice(-8)}`,
+        })), controller.signal);
+        requireLive(services, controller.signal);
+        if (!selection) return;
+        const detail = await services.invoke(["feedback-get", "--stdin"], { feedback_id: selection.value }, 60_000, controller.signal);
+        requireLive(services, controller.signal);
+        const feedback = storedFeedback(detail.feedback);
+        if (selection.action === "select") {
+          await showReadOnlyDetails(ctx, `反馈与证据 · ${feedback.group_name ?? "待分组"}`, feedbackDetail(detail), { signal: controller.signal });
+          requireLive(services, controller.signal);
+          continue;
+        }
+
+        const typeMenu = new MenuSession(ctx);
+        const sentiment = await typeMenu.select(
+          `feedback-evaluation-type:${feedback.id}`,
+          "编辑评价类型（暂存）",
+          [feedback.sentiment, feedback.sentiment === "good" ? "fix" : "good"].map((value) => ({ value, label: value })),
+          controller.signal,
+        );
+        requireLive(services, controller.signal);
+        if (sentiment !== "good" && sentiment !== "fix") continue;
+        const reason = await ctx.ui.editor(
+          `编辑评价理由 · 提交即覆盖保存 ${sentiment} 类型与完整理由`,
+          feedback.reason,
+        );
+        requireLive(services, controller.signal);
+        if (reason === undefined) continue;
+        let updated: Record<string, unknown>;
+        try {
+          updated = await services.invoke(["feedback-edit-evaluation", "--stdin"], {
+            feedback_id: feedback.id,
+            expected_evaluation: feedbackEvaluation(feedback),
+            sentiment,
+            reason,
+          }, 120_000, controller.signal);
+        } catch (error) {
+          if (error instanceof PreferenceCliCleanupError) throw error;
+          requireLive(services, controller.signal);
+          notify(ctx, `评价未保存：${taskError(error)}`, "warning");
+          continue;
+        }
+        requireLive(services, controller.signal);
+        if (updated.stale === true) {
+          notify(ctx, "评价未保存：该反馈已被另一操作修改，请基于最新内容重新编辑。", "warning");
+          continue;
+        }
+        if (updated.changed !== true) {
+          notify(ctx, "评价没有变化，未写入数据。", "info");
+          continue;
+        }
+        const saved = storedFeedback(updated.feedback);
+        const invalidated = Number(updated.invalidated_proposal_count ?? 0);
+        const evidenceMessage = saved.evidence_id
+          ? "已有证据未自动更新，可从重新整理反馈更新。"
+          : "尚未形成证据，等待主动继续整理。";
+        const proposalMessage = invalidated > 0 ? ` ${invalidated} 个相关规则候选已失效。` : "";
+        notify(ctx, `评价已更新。${evidenceMessage}${proposalMessage}`, "info");
       }
-      const selected = await menu.select("feedback-records", "反馈与证据", rows.map((row, index) => ({
-        value: row.id,
-        label: `${index + 1}. ${row.created_at} · ${row.group_name ?? "待分组"} · ${feedbackStatus(row.status)} · ${row.reason.slice(0, 60)} · ${row.id.slice(-8)}`,
-      })));
-      if (!selected) return;
-      const detail = await services.invoke(["feedback-get", "--stdin"], { feedback_id: selected });
-      const feedback = storedFeedback(detail.feedback);
-      await showReadOnlyDetails(ctx, `反馈与证据 · ${feedback.group_name ?? "待分组"}`, feedbackDetail(detail));
+    } finally {
+      foregroundControllers.delete(controller);
     }
   }
 
@@ -1096,17 +1203,22 @@ export function preferenceExtension(pi: ExtensionAPI): void {
     for (const item of feedback) {
       actions.push({
         value: `feedback:${item.id}`,
-        label: `${actions.length + 1}. 反馈 · ${feedbackStatus(item.status)} · ${item.reason.slice(0, 50)} · ${item.id.slice(-8)}`,
+        label: `${actions.length + 1}. 反馈 · ${feedbackStatus(item.status)} · ${singleLineSummary(item.reason, 50)} · ${item.id.slice(-8)}`,
         run: async () => {
           const detail = await services.invoke(["feedback-get", "--stdin"], { feedback_id: item.id });
           const current = storedFeedback(detail.feedback);
           if (current.extraction) {
-            const groupName = await completeStoredExtraction(ctx, current, services, undefined, true);
+            const groupName = await completeStoredExtraction(ctx, current, feedbackEvaluation(current), services, undefined, true);
             if (!groupName) notify(ctx, "反馈仍保留为待分组。", "info");
             return;
           }
           if (!services.model) {
-            await services.invoke(["feedback-fail", "--stdin"], { feedback_id: current.id, error: "当前 Pi 模型不可用" });
+            const failed = await services.invoke(["feedback-fail", "--stdin"], {
+              feedback_id: current.id,
+              expected_evaluation: feedbackEvaluation(current),
+              error: "当前 Pi 模型不可用",
+            });
+            requireCurrentEvaluation(failed);
             notify(ctx, "当前 Pi 模型不可用，反馈仍保留待重试。", "warning");
             return;
           }
