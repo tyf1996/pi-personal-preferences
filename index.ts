@@ -29,6 +29,8 @@ import { captureCurrentPiModel, runCapturedPiModelBlocking, type CapturedPiModel
 const baseDir = dirname(fileURLToPath(import.meta.url));
 const CLI_NAME = "wikiskill_preference.py";
 const MAX_SELECTED_CONVERSATION_BYTES = 4 * 1024 * 1024;
+const REMINDER_CUSTOM_TYPE = "personal-preferences-reminder";
+const REMINDER_TEXT = "请牢记偏好规则。";
 
 interface ExtractionResult {
   group: { name: string | null; certain: boolean; reason: string };
@@ -460,6 +462,8 @@ export function preferenceExtension(pi: ExtensionAPI): void {
   let generation = 0;
   let currentContext: ExtensionContext | null = null;
   let currentInvoke: BoundServices["invoke"] | null = null;
+  let preferencePromptGeneration = 0;
+  let activePreferencePrompt: { sessionGeneration: number; promptGeneration: number; block: string } | null = null;
   const foregroundControllers = new Set<AbortController>();
   const statusRefreshes = new Set<StatusRefresh>();
   const statusCleanupErrors = new Map<number, PreferenceCliCleanupError>();
@@ -1257,6 +1261,8 @@ export function preferenceExtension(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     generation += 1;
+    preferencePromptGeneration += 1;
+    activePreferencePrompt = null;
     live = true;
     currentContext = ctx;
     currentInvoke = boundInvoker(preferenceDataRoot(), cliPath());
@@ -1272,6 +1278,8 @@ export function preferenceExtension(pi: ExtensionAPI): void {
     const closingGeneration = generation;
     live = false;
     generation += 1;
+    preferencePromptGeneration += 1;
+    activePreferencePrompt = null;
     for (const controller of foregroundControllers) controller.abort();
     const taskShutdown = tasks.shutdown();
     const statusShutdown = closeStatusRefreshes(closingGeneration);
@@ -1281,6 +1289,9 @@ export function preferenceExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
+    const sessionGeneration = generation;
+    const promptGeneration = ++preferencePromptGeneration;
+    activePreferencePrompt = null;
     if (configPresence() !== "ready") return undefined;
     const invoke = currentInvoke ?? boundInvoker(preferenceDataRoot(), cliPath());
     try {
@@ -1293,13 +1304,33 @@ export function preferenceExtension(pi: ExtensionAPI): void {
         : [];
       const rendered = renderGroupPrompt(groups, names);
       if (!rendered) return undefined;
-      return {
-        systemPrompt: `${event.systemPrompt}\n\n## Personal Preferences\nThese preferences have lower priority than safety, correctness, the user's current request, and AGENTS.md.\n\n${rendered}`,
-      };
+      const block = `## Personal Preferences\nThese preferences have lower priority than safety, correctness, the user's current request, and AGENTS.md.\n\n${rendered}`;
+      if (live && generation === sessionGeneration && preferencePromptGeneration === promptGeneration) {
+        activePreferencePrompt = { sessionGeneration, promptGeneration, block };
+      }
+      return { systemPrompt: `${event.systemPrompt}\n\n${block}` };
     } catch (error) {
       notify(ctx, taskError(error), "warning");
       return undefined;
     }
+  });
+
+  pi.on("context", (event, ctx) => {
+    const messages = event.messages.filter((message) =>
+      message.role !== "custom" || message.customType !== REMINDER_CUSTOM_TYPE);
+    const prompt = activePreferencePrompt;
+    if (prompt && live && prompt.sessionGeneration === generation
+      && prompt.promptGeneration === preferencePromptGeneration
+      && ctx.getSystemPrompt().includes(prompt.block)) {
+      messages.push({
+        role: "custom",
+        customType: REMINDER_CUSTOM_TYPE,
+        content: REMINDER_TEXT,
+        display: false,
+        timestamp: Date.now(),
+      });
+    }
+    return { messages };
   });
 
   pi.on("agent_settled", async (_event, ctx) => {

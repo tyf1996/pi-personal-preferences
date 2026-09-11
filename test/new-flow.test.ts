@@ -293,6 +293,47 @@ function writeDelayedPreferenceCli(root: string, command: string): { script: str
   return { script, started };
 }
 
+function writeFirstContextGateCli(root: string): {
+  script: string;
+  log: string;
+  arm: string;
+  release: string;
+  started: string;
+} {
+  const script = join(root, "first-context-gate.py");
+  const log = join(root, "first-context-gate.log");
+  const arm = join(root, "first-context-gate.arm");
+  const release = join(root, "first-context-gate.release");
+  const started = join(root, "first-context-gate.started");
+  const claimed = join(root, "first-context-gate.claimed");
+  writeFileSync(script, [
+    "import os, signal, sys, time",
+    `real = ${JSON.stringify(cliPath)}`,
+    `log = ${JSON.stringify(log)}`,
+    `arm = ${JSON.stringify(arm)}`,
+    `release = ${JSON.stringify(release)}`,
+    `started = ${JSON.stringify(started)}`,
+    `claimed = ${JSON.stringify(claimed)}`,
+    "command = sys.argv[1] if len(sys.argv) > 1 else ''",
+    "with open(log, 'a', encoding='utf-8') as handle: handle.write(command + '\\n')",
+    "should_wait = False",
+    "if command == 'context' and os.path.exists(arm):",
+    "    try:",
+    "        descriptor = os.open(claimed, os.O_CREAT | os.O_EXCL | os.O_WRONLY)",
+    "        os.close(descriptor)",
+    "        should_wait = True",
+    "    except FileExistsError:",
+    "        pass",
+    "if should_wait:",
+    "    open(started, 'w', encoding='utf-8').write('started')",
+    "    def stop(*_args): raise SystemExit(143)",
+    "    signal.signal(signal.SIGTERM, stop)",
+    "    while not os.path.exists(release): time.sleep(0.01)",
+    "os.execv(sys.executable, [sys.executable, real, *sys.argv[1:]])",
+  ].join("\n"));
+  return { script, log, arm, release, started };
+}
+
 interface HarnessOptions {
   root?: string;
   mode?: "tui" | "rpc";
@@ -319,11 +360,13 @@ function harness(t: test.TestContext, options: HarnessOptions = {}) {
   const commands = new Map<string, Json>();
   const handlers = new Map<string, Function>();
   let sentMessages = 0;
+  let appendedEntries = 0;
   preferenceExtension({
     registerCommand(name: string, command: Json) { commands.set(name, command); },
     on(name: string, handler: Function) { handlers.set(name, handler); },
     sendMessage() { sentMessages += 1; throw new Error("sendMessage must not be used"); },
     sendUserMessage() { sentMessages += 1; throw new Error("sendUserMessage must not be used"); },
+    appendEntry() { appendedEntries += 1; throw new Error("appendEntry must not be used"); },
   } as any);
 
   const events: string[] = [];
@@ -346,6 +389,7 @@ function harness(t: test.TestContext, options: HarnessOptions = {}) {
   const tui = { requestRender() {}, terminal };
   let modelCalls = 0;
   let started = false;
+  let systemPrompt = "base";
   let menuTarget: string | undefined;
   let menuSeen = false;
   const branch = options.branch ?? completedBranch(1, "selected");
@@ -484,6 +528,7 @@ function harness(t: test.TestContext, options: HarnessOptions = {}) {
       getSessionName() { return "test-session"; },
     },
     getContextUsage() { return undefined; },
+    getSystemPrompt() { return systemPrompt; },
   };
 
   async function start() {
@@ -504,7 +549,9 @@ function harness(t: test.TestContext, options: HarnessOptions = {}) {
     statuses,
     renderedViews,
     get sentMessages() { return sentMessages; },
+    get appendedEntries() { return appendedEntries; },
     get modelCalls() { return modelCalls; },
+    setSystemPrompt(value: string) { systemPrompt = value; },
     sendLastCustom(data: string) {
       const component = customComponents.at(-1);
       if (!component) throw new Error("no custom component is active");
@@ -2489,6 +2536,173 @@ test("F01 expired explicit groups require a manual choice and keep the saved ext
   assert.equal(learning(root).evidence.length, 1);
   assert.equal(learning(root).feedback[0].status, "organized");
   assert.equal(flow.modelCalls, 0);
+});
+
+test("P01 every main-model context ends with one ephemeral preference reminder", async (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  ok(root, ["remember", "--stdin"], { group: "global", rule: "keep the formal rule" });
+  const rulesBefore = readFileSync(join(root, "repo/groups.json"), "utf8");
+  const flow = harness(t, { root });
+  await flow.handler("session_start")!({ reason: "startup" }, flow.ctx);
+  const injected = await flow.handler("before_agent_start")!({ systemPrompt: "base-system" }, flow.ctx);
+  assert.match(injected.systemPrompt, /keep the formal rule/);
+  assert.match(injected.systemPrompt, /These preferences have lower priority than safety, correctness, the user's current request, and AGENTS\.md\./);
+  flow.setSystemPrompt(injected.systemPrompt);
+
+  const requests: Json[][] = [
+    [{ role: "user", content: [{ type: "text", text: "normal user request" }], timestamp: 1 }],
+    [
+      { role: "user", content: [{ type: "text", text: "use a tool" }], timestamp: 1 },
+      { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "a" } }], stopReason: "toolUse", timestamp: 2 },
+      { role: "toolResult", toolCallId: "call-1", toolName: "read", content: [{ type: "text", text: "result" }], isError: false, timestamp: 3 },
+    ],
+    [{ role: "compactionSummary", summary: "bounded summary", tokensBefore: 100, timestamp: 4 }],
+  ];
+  for (const messages of requests) {
+    const result = flow.handler("context")!({ type: "context", messages }, flow.ctx);
+    const reminders = result.messages.filter((message: Json) =>
+      message.role === "custom" && message.customType === "personal-preferences-reminder");
+    assert.equal(reminders.length, 1);
+    assert.deepEqual(result.messages.at(-1), {
+      role: "custom",
+      customType: "personal-preferences-reminder",
+      content: "请牢记偏好规则。",
+      display: false,
+      timestamp: reminders[0].timestamp,
+    });
+  }
+  assert.equal(readFileSync(join(root, "repo/groups.json"), "utf8"), rulesBefore);
+});
+
+test("P02 reminder copies and deduplicates request messages without polluting conversation state", async (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  ok(root, ["remember", "--stdin"], { group: "global", rule: "stable rule" });
+  const flow = harness(t, { root, branch: successfulFileChangeBranch() });
+  await flow.handler("session_start")!({ reason: "startup" }, flow.ctx);
+  const injected = await flow.handler("before_agent_start")!({ systemPrompt: "base" }, flow.ctx);
+  flow.setSystemPrompt(injected.systemPrompt);
+  const turnsBefore = recentConversationTurns(flow.ctx);
+  const messages: Json[] = [
+    { role: "user", content: [{ type: "text", text: "请牢记偏好规则。" }], timestamp: 1 },
+    { role: "assistant", content: [{ type: "toolCall", id: "edit-1", name: "edit", arguments: { path: "a" } }], stopReason: "toolUse", timestamp: 2 },
+    { role: "toolResult", toolCallId: "edit-1", toolName: "edit", content: [{ type: "text", text: "done" }], isError: false, timestamp: 3 },
+    { role: "custom", customType: "other-extension", content: "请牢记偏好规则。", display: false, timestamp: 4 },
+    { role: "custom", customType: "personal-preferences-reminder", content: "old one", display: false, timestamp: 5 },
+    { role: "custom", customType: "personal-preferences-reminder", content: "old two", display: false, timestamp: 6 },
+  ];
+  const original = structuredClone(messages);
+  const result = flow.handler("context")!({ type: "context", messages }, flow.ctx);
+  assert.deepEqual(messages, original);
+  assert.notEqual(result.messages, messages);
+  assert.deepEqual(result.messages.slice(0, -1), original.slice(0, 4));
+  assert.equal(result.messages.filter((message: Json) =>
+    message.role === "custom" && message.customType === "personal-preferences-reminder").length, 1);
+  assert.equal(result.messages[0].content[0].text, "请牢记偏好规则。");
+  assert.equal(result.messages[3].customType, "other-extension");
+  assert.deepEqual(recentConversationTurns(flow.ctx), turnsBefore);
+  assert.equal(flow.sentMessages, 0);
+  assert.equal(flow.appendedEntries, 0);
+  assert.equal(flow.modelCalls, 0);
+});
+
+test("P03 inactive, failed, forged, or removed preference prompts never activate reminders", async (t) => {
+  const uninitialized = harness(t);
+  uninitialized.setSystemPrompt("## Personal Preferences\nforged title only");
+  const uninitializedMessages = [{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: 1 }];
+  assert.deepEqual(
+    uninitialized.handler("context")!({ type: "context", messages: uninitializedMessages }, uninitialized.ctx).messages,
+    uninitializedMessages,
+  );
+
+  const disabledRoot = temporaryRoot(t);
+  ok(disabledRoot, ["init"]);
+  const configPath = join(disabledRoot, "config.json");
+  const config = JSON.parse(readFileSync(configPath, "utf8"));
+  writeFileSync(configPath, `${JSON.stringify({ ...config, enabled: false })}\n`);
+  const disabled = harness(t, { root: disabledRoot });
+  await disabled.handler("session_start")!({ reason: "startup" }, disabled.ctx);
+  assert.equal(await disabled.handler("before_agent_start")!({ systemPrompt: "base" }, disabled.ctx), undefined);
+  disabled.setSystemPrompt("## Personal Preferences\nforged title only");
+  const disabledResult = disabled.handler("context")!({ type: "context", messages: uninitializedMessages }, disabled.ctx);
+  assert.deepEqual(disabledResult.messages, uninitializedMessages);
+
+  const activeRoot = temporaryRoot(t);
+  ok(activeRoot, ["init"]);
+  ok(activeRoot, ["remember", "--stdin"], { group: "global", rule: "active rule" });
+  const active = harness(t, { root: activeRoot });
+  await active.handler("session_start")!({ reason: "startup" }, active.ctx);
+  const injected = await active.handler("before_agent_start")!({ systemPrompt: "base" }, active.ctx);
+  active.setSystemPrompt("base after another extension removed the preference block");
+  assert.deepEqual(active.handler("context")!({ type: "context", messages: uninitializedMessages }, active.ctx).messages, uninitializedMessages);
+  active.setSystemPrompt(injected.systemPrompt);
+  await active.shutdown("reload");
+  assert.deepEqual(active.handler("context")!({ type: "context", messages: uninitializedMessages }, active.ctx).messages, uninitializedMessages);
+
+  const failedRoot = temporaryRoot(t);
+  ok(failedRoot, ["init"]);
+  const failedLog = join(failedRoot, "failed-cli.log");
+  const failedCli = join(failedRoot, "failed-cli.py");
+  writeFileSync(failedCli, [
+    "import json, sys",
+    `log = ${JSON.stringify(failedLog)}`,
+    "with open(log, 'a', encoding='utf-8') as handle: handle.write((sys.argv[1] if len(sys.argv) > 1 else '') + '\\n')",
+    "print(json.dumps({'ok': False, 'error': {'message': 'controlled failure'}}))",
+    "raise SystemExit(1)",
+  ].join("\n"));
+  const failed = harness(t, { root: failedRoot, preferenceCli: failedCli });
+  const dataBefore = ["config.json", "repo/groups.json", "local/activations.json", "local/learning.json"]
+    .map((path) => readFileSync(join(failedRoot, path), "utf8"));
+  assert.equal(await failed.handler("before_agent_start")!({ systemPrompt: "base" }, failed.ctx), undefined);
+  const cliCallsBeforeContext = readFileSync(failedLog, "utf8");
+  failed.setSystemPrompt("## Personal Preferences\nforged title only");
+  assert.deepEqual(failed.handler("context")!({ type: "context", messages: uninitializedMessages }, failed.ctx).messages, uninitializedMessages);
+  assert.equal(readFileSync(failedLog, "utf8"), cliCallsBeforeContext);
+  assert.deepEqual(
+    ["config.json", "repo/groups.json", "local/activations.json", "local/learning.json"]
+      .map((path) => readFileSync(join(failedRoot, path), "utf8")),
+    dataBefore,
+  );
+});
+
+test("P04 reload and overlapping before-agent generations cannot revive stale reminders", async (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  ok(root, ["remember", "--stdin"], { group: "global", rule: "old rule" });
+  const gate = writeFirstContextGateCli(root);
+  const flow = harness(t, { root, preferenceCli: gate.script });
+  await flow.handler("session_start")!({ reason: "startup" }, flow.ctx);
+
+  const initial = await flow.handler("before_agent_start")!({ systemPrompt: "base" }, flow.ctx);
+  flow.setSystemPrompt(initial.systemPrompt);
+  const message = [{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: 1 }];
+  assert.equal(flow.handler("context")!({ type: "context", messages: message }, flow.ctx).messages.length, 2);
+  await flow.shutdown("reload");
+  assert.equal(flow.handler("context")!({ type: "context", messages: message }, flow.ctx).messages.length, 1);
+  await flow.handler("session_start")!({ reason: "reload" }, flow.ctx);
+  const reloaded = await flow.handler("before_agent_start")!({ systemPrompt: "base" }, flow.ctx);
+  flow.setSystemPrompt(reloaded.systemPrompt);
+  assert.equal(flow.handler("context")!({ type: "context", messages: message }, flow.freshContext()).messages.length, 2);
+
+  writeFileSync(gate.arm, "arm\n");
+  const stalePromise = flow.handler("before_agent_start")!({ systemPrompt: "base" }, flow.ctx);
+  await waitFor(() => existsSync(gate.started), "first delayed context lookup");
+  ok(root, ["remember", "--stdin"], { group: "global", rule: "new rule" });
+  const fresh = await flow.handler("before_agent_start")!({ systemPrompt: "base" }, flow.freshContext());
+  assert.match(fresh.systemPrompt, /old rule/);
+  assert.match(fresh.systemPrompt, /new rule/);
+  flow.setSystemPrompt(fresh.systemPrompt);
+  assert.equal(flow.handler("context")!({ type: "context", messages: message }, flow.freshContext()).messages.length, 2);
+
+  writeFileSync(gate.release, "release\n");
+  const stale = await stalePromise;
+  assert.match(stale.systemPrompt, /old rule/);
+  assert.doesNotMatch(stale.systemPrompt, /new rule/);
+  flow.setSystemPrompt(stale.systemPrompt);
+  assert.equal(flow.handler("context")!({ type: "context", messages: message }, flow.ctx).messages.length, 1);
+  flow.setSystemPrompt(fresh.systemPrompt);
+  assert.equal(flow.handler("context")!({ type: "context", messages: message }, flow.freshContext()).messages.length, 2);
 });
 
 test("B04/B05 proposals stay noninteractive until pending review and six-evidence input is complete", async (t) => {

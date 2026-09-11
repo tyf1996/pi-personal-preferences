@@ -157,6 +157,8 @@ local/learning.json
 - 手动演化 prepare 同时绑定目标组与所选证据投影，前后端均执行 4 MiB 门禁；apply 复核组和所选证据 digest，只修改正式规则/Git。未选证据变化不误阻止应用。
 - 正式规则只在当前有效组中注入，并低于安全、正确性、用户当前请求和 `AGENTS.md`；反馈、证据和未确认候选不通过消息 API 进入日常模型上下文。
 
+偏好片段成功注入且仍存在于当前系统提示时，扩展会在主 Agent 每次模型调用（包括工具循环）使用的请求副本末尾临时追加隐藏的 `custom` 消息“请牢记偏好规则。”。提醒不会写入会话、改写用户文本、调用 CLI、读取磁盘或触发额外模型请求；同一请求中的旧提醒只按扩展专用 `customType` 去重。关闭、注入失败、reload/shutdown 或偏好片段被后置扩展移除时不追加。
+
 ## 开发检查
 
 新流程使用一个小型 Node 测试文件。测试只使用临时数据 root、包内 Python 和 fake `ctx.modelRegistry.complete`，不访问真实网络、模型、认证或用户数据：
@@ -169,7 +171,7 @@ npm --prefix extensions/pi-personal-preferences run typecheck
 npm --prefix extensions/pi-personal-preferences run check
 ```
 
-`npm run check` 和扩展 CI 都会运行这组快速测试。U01–U08 覆盖常驻入口、多选、单条/历史证据、精确模型输入、完整预览、零写取消、规则事务、自动候选分支及shutdown。T01–T08 覆盖 message/块顺序、最终成功结果原位置、局部 call_id、新旧结构校验、4 MiB、后台与重整精确快照、单事件引文和选择器派生。C01–C07 继续覆盖成功 edit/write 配对、patch/diff 与替换 fallback、非连续轮次、工具引文及三条触发；N01–N04 覆盖真实 SelectList 上下左右键、层级返回、按稳定值记忆、动态条目、短终端和 RPC 原生选择。Q01–Q06 使用受控 gate 和真实子进程验证重叠状态刷新、批内失败、abort/timeout、父进程先退出且后代忽略 SIGTERM、明确 cleanup 超期，以及 shutdown 后再删除临时根。套件继续保留 R01–R10、两阶段 shutdown、Git/文件保护和分块 UTF-8 解码等断言。替身消息和模型只证明输入、调用与持久化边界，不代表完整磁盘副作用发现或真实 provider 语义质量。
+`npm run check` 和扩展 CI 都会运行这组快速测试。P01–P04 覆盖每次请求末尾提醒、请求副本与精确去重、关闭/失败/片段缺失边界，以及 reload 和迟到 generation 保护。U01–U08 覆盖常驻入口、多选、单条/历史证据、精确模型输入、完整预览、零写取消、规则事务、自动候选分支及shutdown。T01–T08 覆盖 message/块顺序、最终成功结果原位置、局部 call_id、新旧结构校验、4 MiB、后台与重整精确快照、单事件引文和选择器派生。C01–C07 继续覆盖成功 edit/write 配对、patch/diff 与替换 fallback、非连续轮次、工具引文及三条触发；N01–N04 覆盖真实 SelectList 上下左右键、层级返回、按稳定值记忆、动态条目、短终端和 RPC 原生选择。Q01–Q06 使用受控 gate 和真实子进程验证重叠状态刷新、批内失败、abort/timeout、父进程先退出且后代忽略 SIGTERM、明确 cleanup 超期，以及 shutdown 后再删除临时根。套件继续保留 R01–R10、两阶段 shutdown、Git/文件保护和分块 UTF-8 解码等断言。替身消息和模型只证明输入、调用与持久化边界，不代表完整磁盘副作用发现或真实 provider 语义质量。
 
 Python 源位于 `skills/wikiskill/scripts/`，执行以下命令同步到独立扩展包：
 
