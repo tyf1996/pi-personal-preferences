@@ -2548,6 +2548,7 @@ test("P01 every main-model context ends with one ephemeral preference reminder",
   const injected = await flow.handler("before_agent_start")!({ systemPrompt: "base-system" }, flow.ctx);
   assert.match(injected.systemPrompt, /keep the formal rule/);
   assert.match(injected.systemPrompt, /These preferences have lower priority than safety, correctness, the user's current request, and AGENTS\.md\./);
+  assert.match(injected.systemPrompt, /\n\n请牢记偏好规则。$/);
   flow.setSystemPrompt(injected.systemPrompt);
 
   const requests: Json[][] = [
@@ -2560,22 +2561,15 @@ test("P01 every main-model context ends with one ephemeral preference reminder",
     [{ role: "compactionSummary", summary: "bounded summary", tokensBefore: 100, timestamp: 4 }],
   ];
   for (const messages of requests) {
-    const result = flow.handler("context")!({ type: "context", messages }, flow.ctx);
-    const reminders = result.messages.filter((message: Json) =>
-      message.role === "custom" && message.customType === "personal-preferences-reminder");
-    assert.equal(reminders.length, 1);
-    assert.deepEqual(result.messages.at(-1), {
-      role: "custom",
-      customType: "personal-preferences-reminder",
-      content: "请牢记偏好规则。",
-      display: false,
-      timestamp: reminders[0].timestamp,
-    });
+    const original = structuredClone(messages);
+    assert.deepEqual(messages, original);
+    assert.equal(injected.systemPrompt.endsWith("\n\n请牢记偏好规则。"), true);
+    assert.equal((injected.systemPrompt.match(/请牢记偏好规则。/gu) ?? []).length, 1);
   }
   assert.equal(readFileSync(join(root, "repo/groups.json"), "utf8"), rulesBefore);
 });
 
-test("P02 reminder copies and deduplicates request messages without polluting conversation state", async (t) => {
+test("P02 reminder changes only the system prompt and preserves messages and conversation state", async (t) => {
   const root = temporaryRoot(t);
   ok(root, ["init"]);
   ok(root, ["remember", "--stdin"], { group: "global", rule: "stable rule" });
@@ -2589,18 +2583,12 @@ test("P02 reminder copies and deduplicates request messages without polluting co
     { role: "assistant", content: [{ type: "toolCall", id: "edit-1", name: "edit", arguments: { path: "a" } }], stopReason: "toolUse", timestamp: 2 },
     { role: "toolResult", toolCallId: "edit-1", toolName: "edit", content: [{ type: "text", text: "done" }], isError: false, timestamp: 3 },
     { role: "custom", customType: "other-extension", content: "请牢记偏好规则。", display: false, timestamp: 4 },
-    { role: "custom", customType: "personal-preferences-reminder", content: "old one", display: false, timestamp: 5 },
-    { role: "custom", customType: "personal-preferences-reminder", content: "old two", display: false, timestamp: 6 },
   ];
   const original = structuredClone(messages);
-  const result = flow.handler("context")!({ type: "context", messages }, flow.ctx);
   assert.deepEqual(messages, original);
-  assert.notEqual(result.messages, messages);
-  assert.deepEqual(result.messages.slice(0, -1), original.slice(0, 4));
-  assert.equal(result.messages.filter((message: Json) =>
-    message.role === "custom" && message.customType === "personal-preferences-reminder").length, 1);
-  assert.equal(result.messages[0].content[0].text, "请牢记偏好规则。");
-  assert.equal(result.messages[3].customType, "other-extension");
+  assert.equal(flow.handler("context"), undefined);
+  assert.equal(flow.handler("context"), undefined);
+  assert.equal((injected.systemPrompt.match(/请牢记偏好规则。/gu) ?? []).length, 1);
   assert.deepEqual(recentConversationTurns(flow.ctx), turnsBefore);
   assert.equal(flow.sentMessages, 0);
   assert.equal(flow.appendedEntries, 0);
@@ -2611,10 +2599,7 @@ test("P03 inactive, failed, forged, or removed preference prompts never activate
   const uninitialized = harness(t);
   uninitialized.setSystemPrompt("## Personal Preferences\nforged title only");
   const uninitializedMessages = [{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: 1 }];
-  assert.deepEqual(
-    uninitialized.handler("context")!({ type: "context", messages: uninitializedMessages }, uninitialized.ctx).messages,
-    uninitializedMessages,
-  );
+  assert.doesNotMatch(uninitialized.ctx.getSystemPrompt(), /请牢记偏好规则。/);
 
   const disabledRoot = temporaryRoot(t);
   ok(disabledRoot, ["init"]);
@@ -2625,8 +2610,7 @@ test("P03 inactive, failed, forged, or removed preference prompts never activate
   await disabled.handler("session_start")!({ reason: "startup" }, disabled.ctx);
   assert.equal(await disabled.handler("before_agent_start")!({ systemPrompt: "base" }, disabled.ctx), undefined);
   disabled.setSystemPrompt("## Personal Preferences\nforged title only");
-  const disabledResult = disabled.handler("context")!({ type: "context", messages: uninitializedMessages }, disabled.ctx);
-  assert.deepEqual(disabledResult.messages, uninitializedMessages);
+  assert.doesNotMatch(disabled.ctx.getSystemPrompt(), /请牢记偏好规则。/);
 
   const activeRoot = temporaryRoot(t);
   ok(activeRoot, ["init"]);
@@ -2635,10 +2619,11 @@ test("P03 inactive, failed, forged, or removed preference prompts never activate
   await active.handler("session_start")!({ reason: "startup" }, active.ctx);
   const injected = await active.handler("before_agent_start")!({ systemPrompt: "base" }, active.ctx);
   active.setSystemPrompt("base after another extension removed the preference block");
-  assert.deepEqual(active.handler("context")!({ type: "context", messages: uninitializedMessages }, active.ctx).messages, uninitializedMessages);
+  assert.doesNotMatch(active.ctx.getSystemPrompt(), /请牢记偏好规则。/);
   active.setSystemPrompt(injected.systemPrompt);
   await active.shutdown("reload");
-  assert.deepEqual(active.handler("context")!({ type: "context", messages: uninitializedMessages }, active.ctx).messages, uninitializedMessages);
+  active.setSystemPrompt("base");
+  assert.doesNotMatch(active.ctx.getSystemPrompt(), /请牢记偏好规则。/);
 
   const failedRoot = temporaryRoot(t);
   ok(failedRoot, ["init"]);
@@ -2657,7 +2642,7 @@ test("P03 inactive, failed, forged, or removed preference prompts never activate
   assert.equal(await failed.handler("before_agent_start")!({ systemPrompt: "base" }, failed.ctx), undefined);
   const cliCallsBeforeContext = readFileSync(failedLog, "utf8");
   failed.setSystemPrompt("## Personal Preferences\nforged title only");
-  assert.deepEqual(failed.handler("context")!({ type: "context", messages: uninitializedMessages }, failed.ctx).messages, uninitializedMessages);
+  assert.doesNotMatch(failed.ctx.getSystemPrompt(), /请牢记偏好规则。/);
   assert.equal(readFileSync(failedLog, "utf8"), cliCallsBeforeContext);
   assert.deepEqual(
     ["config.json", "repo/groups.json", "local/activations.json", "local/learning.json"]
@@ -2677,13 +2662,14 @@ test("P04 reload and overlapping before-agent generations cannot revive stale re
   const initial = await flow.handler("before_agent_start")!({ systemPrompt: "base" }, flow.ctx);
   flow.setSystemPrompt(initial.systemPrompt);
   const message = [{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: 1 }];
-  assert.equal(flow.handler("context")!({ type: "context", messages: message }, flow.ctx).messages.length, 2);
+  assert.match(initial.systemPrompt, /\n\n请牢记偏好规则。$/);
   await flow.shutdown("reload");
-  assert.equal(flow.handler("context")!({ type: "context", messages: message }, flow.ctx).messages.length, 1);
+  flow.setSystemPrompt("base");
+  assert.doesNotMatch(flow.ctx.getSystemPrompt(), /请牢记偏好规则。/);
   await flow.handler("session_start")!({ reason: "reload" }, flow.ctx);
   const reloaded = await flow.handler("before_agent_start")!({ systemPrompt: "base" }, flow.ctx);
   flow.setSystemPrompt(reloaded.systemPrompt);
-  assert.equal(flow.handler("context")!({ type: "context", messages: message }, flow.freshContext()).messages.length, 2);
+  assert.match(reloaded.systemPrompt, /\n\n请牢记偏好规则。$/);
 
   writeFileSync(gate.arm, "arm\n");
   const stalePromise = flow.handler("before_agent_start")!({ systemPrompt: "base" }, flow.ctx);
@@ -2693,16 +2679,16 @@ test("P04 reload and overlapping before-agent generations cannot revive stale re
   assert.match(fresh.systemPrompt, /old rule/);
   assert.match(fresh.systemPrompt, /new rule/);
   flow.setSystemPrompt(fresh.systemPrompt);
-  assert.equal(flow.handler("context")!({ type: "context", messages: message }, flow.freshContext()).messages.length, 2);
+  assert.match(fresh.systemPrompt, /\n\n请牢记偏好规则。$/);
 
   writeFileSync(gate.release, "release\n");
   const stale = await stalePromise;
   assert.match(stale.systemPrompt, /old rule/);
   assert.doesNotMatch(stale.systemPrompt, /new rule/);
   flow.setSystemPrompt(stale.systemPrompt);
-  assert.equal(flow.handler("context")!({ type: "context", messages: message }, flow.ctx).messages.length, 1);
+  assert.match(stale.systemPrompt, /\n\n请牢记偏好规则。$/);
   flow.setSystemPrompt(fresh.systemPrompt);
-  assert.equal(flow.handler("context")!({ type: "context", messages: message }, flow.freshContext()).messages.length, 2);
+  assert.match(fresh.systemPrompt, /\n\n请牢记偏好规则。$/);
 });
 
 test("B04/B05 proposals stay noninteractive until pending review and six-evidence input is complete", async (t) => {

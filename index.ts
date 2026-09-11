@@ -29,7 +29,6 @@ import { captureCurrentPiModel, runCapturedPiModelBlocking, type CapturedPiModel
 const baseDir = dirname(fileURLToPath(import.meta.url));
 const CLI_NAME = "wikiskill_preference.py";
 const MAX_SELECTED_CONVERSATION_BYTES = 4 * 1024 * 1024;
-const REMINDER_CUSTOM_TYPE = "personal-preferences-reminder";
 const REMINDER_TEXT = "请牢记偏好规则。";
 
 interface ExtractionResult {
@@ -1308,29 +1307,11 @@ export function preferenceExtension(pi: ExtensionAPI): void {
       if (live && generation === sessionGeneration && preferencePromptGeneration === promptGeneration) {
         activePreferencePrompt = { sessionGeneration, promptGeneration, block };
       }
-      return { systemPrompt: `${event.systemPrompt}\n\n${block}` };
+      return { systemPrompt: `${event.systemPrompt}\n\n${block}\n\n${REMINDER_TEXT}` };
     } catch (error) {
       notify(ctx, taskError(error), "warning");
       return undefined;
     }
-  });
-
-  pi.on("context", (event, ctx) => {
-    const messages = event.messages.filter((message) =>
-      message.role !== "custom" || message.customType !== REMINDER_CUSTOM_TYPE);
-    const prompt = activePreferencePrompt;
-    if (prompt && live && prompt.sessionGeneration === generation
-      && prompt.promptGeneration === preferencePromptGeneration
-      && ctx.getSystemPrompt().includes(prompt.block)) {
-      messages.push({
-        role: "custom",
-        customType: REMINDER_CUSTOM_TYPE,
-        content: REMINDER_TEXT,
-        display: false,
-        timestamp: Date.now(),
-      });
-    }
-    return { messages };
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
