@@ -31,6 +31,14 @@ export class BackgroundTasks {
     };
   }
 
+  cancel(kind: BackgroundKind, key: string): boolean {
+    const collection = kind === "feedback" ? this.feedback : this.groups;
+    const task = collection.get(key);
+    if (!task) return false;
+    task.controller.abort();
+    return true;
+  }
+
   start(kind: BackgroundKind, key: string, run: (signal: AbortSignal) => Promise<void>): boolean {
     if (!this.accepting) return false;
     const collection = kind === "feedback" ? this.feedback : this.groups;

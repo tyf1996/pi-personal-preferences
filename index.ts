@@ -1192,7 +1192,7 @@ export function preferenceExtension(pi: ExtensionAPI): void {
     const result = await services.invoke(["pending-list"]);
     const running = tasks.snapshot();
     const feedback = Array.isArray(result.feedback)
-      ? result.feedback.map(storedFeedback).filter((item) => !running.feedbackIds.has(item.id))
+      ? result.feedback.map(storedFeedback)
       : [];
     const proposals = Array.isArray(result.proposals)
       ? result.proposals.map(storedProposal)
@@ -1206,8 +1206,48 @@ export function preferenceExtension(pi: ExtensionAPI): void {
     for (const item of feedback) {
       actions.push({
         value: `feedback:${item.id}`,
-        label: `${actions.length + 1}. 反馈 · ${feedbackStatus(item.status)} · ${singleLineSummary(item.reason, 50)} · ${item.id.slice(-8)}`,
+        label: `${actions.length + 1}. 反馈 · ${feedbackStatus(item.status)}${running.feedbackIds.has(item.id) ? " · 后台处理中" : ""} · ${singleLineSummary(item.reason, 50)} · ${item.id.slice(-8)}`,
         run: async () => {
+          const action = await menu.select("pending-feedback-action", "处理反馈待办", [
+            { value: "continue", label: "继续整理／分组重试" },
+            ...(ctx.mode === "tui" ? [{ value: "delete", label: "删除此待办" }] : []),
+          ]);
+          if (action === "delete") {
+            const summary = [
+              `反馈类型：${item.sentiment}`,
+              `当前状态：${feedbackStatus(item.status)}`,
+              `理由摘要：${singleLineSummary(item.reason, 240)}`,
+              "",
+              "确认后将删除该反馈及其保存的选中对话、提取结果和失败信息。",
+              "不会删除已整理证据、正式规则、规则候选或其他反馈。",
+            ].join("\n");
+            const decision = await showReadOnlyDetails(ctx, "确认删除反馈待办", summary, {
+              decision: true,
+              applyLabel: "确认删除",
+              rejectLabel: "取消删除",
+              laterLabel: "取消删除",
+            });
+            if (decision !== "apply") return;
+            tasks.cancel("feedback", item.id);
+            try {
+              const deleted = await services.invoke(["feedback-delete", "--stdin"], {
+                feedback_id: item.id,
+                expected_status: item.status,
+              });
+              if (deleted.stale === true) {
+                notify(ctx, "删除未执行：该反馈已变化或已整理，请刷新待办后重试。", "warning");
+              } else if (deleted.deleted === true) {
+                notify(ctx, "反馈待办已删除。", "info");
+                await pendingItems(ctx, services, menu);
+              } else {
+                notify(ctx, "删除未执行：后端未确认删除。", "warning");
+              }
+            } catch (error) {
+              notify(ctx, `反馈待办未删除：${taskError(error)}`, "warning");
+            }
+            return;
+          }
+          if (action !== "continue") return;
           const detail = await services.invoke(["feedback-get", "--stdin"], { feedback_id: item.id });
           const current = storedFeedback(detail.feedback);
           if (current.extraction) {

@@ -24,6 +24,7 @@ import {
 } from "../src/feedback-context.ts";
 import { renderPreferenceFooter } from "../src/footer.ts";
 import { MenuSession } from "../src/menu.ts";
+import { BackgroundTasks } from "../src/background-tasks.ts";
 import { runCapturedPiModelBlocking } from "../src/pi-model.ts";
 
 initTheme("dark", false);
@@ -3848,6 +3849,190 @@ test("N04 short menus keep the selected row visible and RPC uses native select",
   } as any).select("rpc", "RPC Menu", [{ value: "one", label: "One" }, { value: "two", label: "Two" }]);
   assert.equal(rpc, "two");
   assert.equal(nativeCalls, 1);
+});
+
+test("D01/D02 pending feedback deletion confirms and removes only the selected pending row", async (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  const saved = ok(root, ["feedback-create", "--stdin"], {
+    sentiment: "fix", reason: "saved reason", selected_turns: [{ user: "u", assistant: "a" }], model: null, group: null,
+  }).feedback;
+  const pending = ok(root, ["feedback-create", "--stdin"], {
+    sentiment: "good", reason: "pending reason", selected_turns: [{ user: "pu", assistant: "pa" }], model: null, group: null,
+  }).feedback;
+  ok(root, ["feedback-extracted", "--stdin"], {
+    feedback_id: pending.id, expected_evaluation: evaluation(pending),
+    extraction: extraction("pa", { name: null, certain: false }), model: { provider: "fake", id: "fake", thinking: "low" },
+  });
+  const failed = ok(root, ["feedback-create", "--stdin"], {
+    sentiment: "fix", reason: "failed reason", selected_turns: [{ user: "fu", assistant: "fa" }], model: null, group: null,
+  }).feedback;
+  ok(root, ["feedback-fail", "--stdin"], {
+    feedback_id: failed.id, expected_evaluation: evaluation(failed), error: "failure",
+  });
+  const beforeGroups = readFileSync(join(root, "repo/groups.json"), "utf8");
+  const beforeEvidence = JSON.stringify(learning(root).evidence);
+  const listed = ok(root, ["pending-list"]);
+  assert.deepEqual(listed.feedback.map((item: Json) => item.id), [failed.id, pending.id, saved.id]);
+  assert.deepEqual(listed.feedback.map((item: Json) => item.status), ["failed", "pending_group", "saved"]);
+  assert.match(`反馈类型：${pending.sentiment}\\n当前状态：待确定分组\\n理由摘要：${pending.reason}`, /反馈类型：good/);
+  assert.match(`反馈类型：${pending.sentiment}\\n当前状态：待确定分组\\n理由摘要：${pending.reason}`, /当前状态：待确定分组/);
+  assert.equal(ok(root, ["feedback-delete", "--stdin"], { feedback_id: pending.id, expected_status: "pending_group" }).deleted, true);
+  assert.equal(learning(root).feedback.some((item: Json) => item.id === pending.id), false);
+  assert.equal(learning(root).feedback.some((item: Json) => item.id === saved.id), true);
+  assert.equal(JSON.stringify(learning(root).evidence), beforeEvidence);
+  assert.equal(readFileSync(join(root, "repo/groups.json"), "utf8"), beforeGroups);
+});
+
+test("D01 TUI deletion confirmation includes summary and cancellation is zero-write", async (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  const feedback = ok(root, ["feedback-create", "--stdin"], {
+    sentiment: "fix", reason: "keep this exact reason", selected_turns: [{ user: "u", assistant: "a" }], model: null, group: null,
+  }).feedback;
+  const before = readFileSync(join(root, "local/learning.json"), "utf8");
+  const flow = harness(t, {
+    root,
+    menuInputs: [
+      { title: "处理待办", keys: ["\x1b[C"] },
+      { title: "处理反馈待办", keys: ["\x1b[B", "\x1b[C"] },
+    ],
+    detailInputs: [["\x1b"]],
+  });
+  await flow.menu("处理待办");
+  assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), before);
+  assert.equal(flow.modelCalls, 0);
+  assert.ok(flow.renderedViews.flat().some((line) => line.includes("反馈类型：fix")));
+  assert.ok(flow.renderedViews.flat().some((line) => line.includes("当前状态：待继续整理")));
+  assert.ok(flow.renderedViews.flat().some((line) => line.includes("理由摘要：keep this exact reason")));
+  assert.equal(learning(root).feedback.some((item: Json) => item.id === feedback.id), true);
+});
+
+test("D02 TUI confirmation deletes only the selected feedback row", async (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  const feedback = ok(root, ["feedback-create", "--stdin"], {
+    sentiment: "good", reason: "delete only me", selected_turns: [{ user: "u", assistant: "a" }], model: null, group: null,
+  }).feedback;
+  const other = ok(root, ["feedback-create", "--stdin"], {
+    sentiment: "fix", reason: "keep other", selected_turns: [{ user: "ou", assistant: "oa" }], model: null, group: null,
+  }).feedback;
+  const beforeGroups = readFileSync(join(root, "repo/groups.json"), "utf8");
+  const flow = harness(t, {
+    root,
+    menuInputs: [
+      { title: "处理待办", keys: ["\x1b[B", "\x1b[C"] },
+      { title: "处理反馈待办", keys: ["\x1b[B", "\x1b[C"] },
+    ],
+    detailInputs: [["a"]],
+  });
+  await flow.menu("处理待办");
+  const stored = learning(root);
+  assert.equal(stored.feedback.some((item: Json) => item.id === feedback.id), false);
+  assert.equal(stored.feedback.some((item: Json) => item.id === other.id), true);
+  assert.equal(stored.evidence.length, 0);
+  assert.equal(readFileSync(join(root, "repo/groups.json"), "utf8"), beforeGroups);
+});
+
+test("D03 feedback-delete strictly validates status, identity, stale rows, and write failures", (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  const feedback = ok(root, ["feedback-create", "--stdin"], {
+    sentiment: "fix", reason: "reason", selected_turns: [{ user: "u", assistant: "a" }], model: null, group: null,
+  }).feedback;
+  const before = readFileSync(join(root, "local/learning.json"), "utf8");
+  for (const payload of [
+    { feedback_id: feedback.id },
+    { feedback_id: feedback.id, expected_status: "saved", extra: true },
+    { feedback_id: "bad id", expected_status: "saved" },
+    { feedback_id: feedback.id, expected_status: "organized" },
+    { feedback_id: "feedback-missing", expected_status: "saved" },
+  ]) {
+    assert.equal(cli(root, ["feedback-delete", "--stdin"], payload).ok, false);
+    assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), before);
+  }
+  const stale = ok(root, ["feedback-delete", "--stdin"], { feedback_id: feedback.id, expected_status: "failed" });
+  assert.equal(stale.stale, true);
+  assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), before);
+  const organized = addCliEvidence(root, 99);
+  const organizedBefore = readFileSync(join(root, "local/learning.json"), "utf8");
+  assert.equal(cli(root, ["feedback-delete", "--stdin"], { feedback_id: organized.id, expected_status: "organized" }).ok, false);
+  assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), organizedBefore);
+  const script = [
+    "import sys", `sys.path.insert(0, ${JSON.stringify(pythonRoot)})`,
+    "import wikiskill_preference as cli", "from wikiskill_preference_core.storage import PreferenceStore",
+    `store = PreferenceStore(${JSON.stringify(root)})`,
+    `payload = ${JSON.stringify({ feedback_id: feedback.id, expected_status: "saved" })}`,
+    "store.write_learning = lambda _value: (_ for _ in ()).throw(OSError('write failed'))",
+    "try:", "    cli._feedback_delete(store, payload)", "except OSError:", "    pass",
+  ].join("\n");
+  const failureBefore = readFileSync(join(root, "local/learning.json"), "utf8");
+  const failed = spawnSync("python3", ["-c", script], { encoding: "utf8" });
+  assert.equal(failed.status, 0, failed.stderr);
+  assert.equal(readFileSync(join(root, "local/learning.json"), "utf8"), failureBefore);
+});
+
+test("D04 BackgroundTasks cancel aborts only the matching feedback task", async () => {
+  const started = deferred<void>();
+  const cancelled = deferred<void>();
+  const tasks = new BackgroundTasks(() => {}, () => {});
+  assert.equal(tasks.start("feedback", "target", async (signal) => {
+    started.resolve();
+    await new Promise<void>((resolvePromise) => signal.addEventListener("abort", () => resolvePromise(), { once: true }));
+    cancelled.resolve();
+  }), true);
+  assert.equal(tasks.start("feedback", "other", async () => {}), true);
+  await started.promise;
+  assert.equal(tasks.cancel("feedback", "target"), true);
+  await cancelled.promise;
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 0));
+  assert.equal(tasks.cancel("feedback", "target"), false);
+  assert.equal(tasks.snapshot().feedbackIds.has("other"), false);
+});
+
+test("D04 integrated deletion cancels a running feedback task before CAS delete and blocks late callbacks", async (t) => {
+  const gate = deferred<ModelReply>();
+  const flow = harness(t, {
+    modelReply: () => gate.promise,
+    menuInputs: [
+      { title: "处理待办", keys: ["\x1b[C"] },
+      { title: "处理反馈待办", keys: ["\x1b[B", "\x1b[C"] },
+    ],
+    detailInputs: [["a"]],
+  });
+  await flow.pref("feedback --group global fix running task");
+  await waitFor(() => flow.modelCalls === 1, "running feedback task");
+  const beforeNotices = flow.notices.length;
+  const deleting = flow.menu("处理待办");
+  await waitFor(() => flow.renderedViews.flat().some((line) => line.includes("后台处理中")), "running pending row");
+  await waitFor(() => flow.renderedViews.flat().some((line) => line.includes("确认删除反馈待办")), "deletion confirmation");
+  gate.resolve(extraction("selected-assistant-0"));
+  await deleting;
+  const stored = learning(flow.root);
+  assert.equal(stored.feedback.length, 0);
+  assert.equal(flow.modelCalls, 1);
+  assert.equal(flow.notices.slice(beforeNotices).some((item) => /整理失败|已整理/u.test(item.message)), false);
+});
+
+test("D05/D06 deletion does not alter formal rules, candidates, or RPC behavior", async (t) => {
+  const root = temporaryRoot(t);
+  ok(root, ["init"]);
+  const feedback = [1, 2, 3].map((index) => addCliEvidence(root, index));
+  const proposal = addProposal(root, "global", ["must remain"]);
+  const pending = ok(root, ["feedback-create", "--stdin"], {
+    sentiment: "fix", reason: "pending", selected_turns: [{ user: "u", assistant: "a" }], model: null, group: null,
+  }).feedback;
+  const before = { groups: readFileSync(join(root, "repo/groups.json"), "utf8"), learning: learning(root) };
+  ok(root, ["feedback-delete", "--stdin"], { feedback_id: pending.id, expected_status: "saved" });
+  const after = learning(root);
+  assert.deepEqual(after.evidence, before.learning.evidence);
+  assert.deepEqual(after.proposals, before.learning.proposals);
+  assert.equal(readFileSync(join(root, "repo/groups.json"), "utf8"), before.groups);
+  assert.equal(ok(root, ["resolve-evolution", "--stdin"], { proposal_id: proposal.id, decision: "reject" }).proposal.status, "rejected");
+  const rpc = harness(t, { root, mode: "rpc", selectReply: () => undefined });
+  await rpc.menu("处理待办");
+  assert.equal(rpc.modelCalls, 0);
+  assert.equal(feedback.length, 3);
 });
 
 test("B12 preference status stays compact while the footer preserves Pi and extension information", () => {

@@ -494,6 +494,28 @@ def _feedback_list(store: PreferenceStore) -> dict[str, Any]:
     return {"ok": True, "feedback": list(reversed(learning["feedback"]))}
 
 
+def _feedback_delete(store: PreferenceStore, value: dict[str, Any]) -> dict[str, Any]:
+    fields = {"feedback_id", "expected_status"}
+    data = _strict(value, fields, fields, "feedback-delete")
+    feedback_id = checked_id(data["feedback_id"], "feedback_id")
+    expected_status = data["expected_status"]
+    if not isinstance(expected_status, str) or expected_status not in {"saved", "pending_group", "failed"}:
+        raise PreferenceValidationError("expected_status must be saved, pending_group, or failed")
+    with store.locked():
+        learning = store.learning()
+        feedback = store.require_feedback(learning, feedback_id)
+        current_status = feedback.get("status")
+        if current_status != expected_status:
+            return {"ok": True, "stale": True, "feedback_id": feedback_id, "status": current_status}
+        if current_status not in {"saved", "pending_group", "failed"}:
+            return {"ok": True, "stale": True, "feedback_id": feedback_id, "status": current_status}
+        if feedback.get("evidence_id") is not None:
+            return {"ok": True, "stale": True, "feedback_id": feedback_id, "status": current_status}
+        learning["feedback"] = [item for item in learning["feedback"] if item["id"] != feedback_id]
+        store.write_learning(learning)
+    return {"ok": True, "deleted": True, "feedback_id": feedback_id, "status": expected_status}
+
+
 def _feedback_evidence(learning: dict[str, Any], feedback: dict[str, Any]) -> dict[str, Any] | None:
     return next((item for item in learning["evidence"] if item.get("id") == feedback.get("evidence_id")), None)
 
@@ -902,6 +924,8 @@ def dispatch(args: argparse.Namespace, stdin_value: dict[str, Any] | None) -> di
         return _feedback_get(store, stdin_value or {})
     if args.command == "feedback-list":
         return _feedback_list(store)
+    if args.command == "feedback-delete":
+        return _feedback_delete(store, stdin_value or {})
     if args.command == "feedback-edit-evaluation":
         return _feedback_edit_evaluation(store, stdin_value or {})
     if args.command == "feedback-reprocess":
@@ -923,7 +947,7 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Pi personal preference backend")
     result.add_argument("command", choices=[
         "init", "status", "groups", "context", "remember", "manage-group", "set-activation", "sync",
-        "feedback-create", "feedback-extracted", "feedback-fail", "feedback-complete", "feedback-get", "feedback-list", "feedback-edit-evaluation", "feedback-reprocess", "pending-list",
+        "feedback-create", "feedback-extracted", "feedback-fail", "feedback-complete", "feedback-get", "feedback-list", "feedback-delete", "feedback-edit-evaluation", "feedback-reprocess", "pending-list",
         "manual-evolution", "prepare-evolution", "save-evolution", "resolve-evolution",
     ])
     result.add_argument("--stdin", action="store_true")
